@@ -264,3 +264,9 @@ body.anim-on #selbar,body.anim-on #xfbar{bottom:calc(122px + env(safe-area-inset
 .fo-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .fo-val{min-width:64px;text-align:center;font-variant-numeric:tabular-nums}
 .anim-pop p{margin:0}
+/* layer groups */
+.lrow.group{gap:6px;min-height:52px}
+.lrow.group .chev{width:36px;height:44px}
+.gicon svg{width:30px;height:30px;color:var(--acc,#e8a54b);display:block}
+.lrow.dim .lthumb,.lrow.dim .lname{opacity:.45}
+.muted.small{font-size:12px;margin:2px 0 6px}

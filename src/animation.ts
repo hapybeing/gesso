@@ -74,8 +74,9 @@ export class Animator {
   frames(): Frame[] {
     const out: Frame[] = [];
     for (const l of this.e.layers) {
+      if (l.parent) continue;                 // a group is one frame: its members are drawn with it
       if (this.st.roles[l.uid]) continue;
-      if (l.clip && out.length && l.visible) { out[out.length - 1].clips.push(l); continue; }
+      if (l.clip && !l.group && out.length && l.visible && !out[out.length - 1].base.group) { out[out.length - 1].clips.push(l); continue; }
       if (!l.visible || l.clip) continue;
       out.push({ base: l, clips: [] });
     }
@@ -86,7 +87,7 @@ export class Animator {
   current(fr = this.frames()): number {
     if (!fr.length) return -1;
     const a = this.e.activeLayer;
-    let i = fr.findIndex((f) => f.base === a || f.clips.includes(a));
+    let i = fr.findIndex((f) => f.base === a || f.clips.includes(a) || this.e.isInside(a, f.base));
     if (i < 0 && this.lastFrame) i = fr.findIndex((f) => f.base.uid === this.lastFrame);
     if (i < 0) i = 0;
     this.lastFrame = fr[i].base.uid;
@@ -114,14 +115,14 @@ export class Animator {
     const roleItems = (role: 'bg' | 'fg') => {
       let clipBase: Layer | null = null;
       for (const l of this.e.layers) {
-        if (this.st.roles[l.uid] !== role) continue;
-        if (!l.clip) clipBase = l;
+        if (l.parent || this.st.roles[l.uid] !== role) continue;
+        if (!l.clip || l.group) clipBase = l.group ? null : l;
         if (!l.visible || l.opacity <= 0) continue;
-        items.push({ layer: l, opacity: l.opacity, clipBase: l.clip && clipBase !== l ? clipBase : null });
+        items.push(...this.e.itemsFor(l, l.opacity, l.blend, undefined, l.clip && clipBase !== l ? clipBase : null));
       }
     };
     const unit = (f: Frame, opacity: number, tint?: [number, number, number, number], keepBlend = false) => {
-      items.push({ layer: f.base, opacity: opacity * (keepBlend ? f.base.opacity : 1), blend: keepBlend ? f.base.blend : 0, tint });
+      items.push(...this.e.itemsFor(f.base, opacity * (keepBlend ? f.base.opacity : 1), keepBlend ? f.base.blend : 0, tint));
       for (const c of f.clips) items.push({ layer: c, opacity: opacity * (keepBlend ? c.opacity : 1), blend: keepBlend ? c.blend : 0, tint, clipBase: f.base });
     };
     roleItems('bg');
@@ -339,7 +340,7 @@ export class Animator {
     clearTimeout(this.thumbTimer);
     this.thumbTimer = window.setTimeout(() => {
       if (this.e.stroking) { this.updateThumbs(); return; }
-      for (const f of this.frames()) { const t = this.thumbs.get(f.base.uid); if (t && t.v !== f.base.version) { t.v = f.base.version; void this.e.thumbnailAsync(f.base, t.c); } }
+      for (const f of this.frames()) { const t = this.thumbs.get(f.base.uid); const v = this.e.contentVersion(f.base); if (t && t.v !== v) { t.v = v; void this.e.thumbnailAsync(f.base, t.c); } }
     }, 120);
   }
 

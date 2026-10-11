@@ -48,6 +48,11 @@ const ICON = {
   copy: '<rect x="8" y="8" width="12" height="12" rx="2"/><path d="M16 8V5a1 1 0 00-1-1H5a1 1 0 00-1 1v10a1 1 0 001 1h3"/>',
   merge: '<path d="M7 4v5a5 5 0 005 5 5 5 0 005-5V4"/><path d="M12 14v6M9 17l3 3 3-3"/>',
   up: '<path d="M12 19V5M6 11l6-6 6 6"/>',
+  folder: '<path d="M3.5 7.5a2 2 0 012-2h4l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2h-13a2 2 0 01-2-2z"/>',
+  folderPlus: '<path d="M3.5 7.5a2 2 0 012-2h4l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2h-13a2 2 0 01-2-2z"/><path d="M12 10.5v6M9 13.5h6"/>',
+  chevDown: '<path d="M7 10l5 5 5-5"/>', chevRight: '<path d="M10 7l5 5-5 5"/>',
+  ungroup: '<path d="M3.5 7.5a2 2 0 012-2h4l2 2h7a2 2 0 012 2v8a2 2 0 01-2 2h-13a2 2 0 01-2-2z" stroke-dasharray="2.5 2"/>',
+  flatten: '<path d="M4 9l8-4 8 4-8 4z"/><path d="M4 15h16"/>',
   down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   fill: '<path d="M5 12l7-7 7 7-7 7z"/><path d="M19.5 15.5s1.5 2 1.5 3a1.5 1.5 0 01-3 0c0-1 1.5-3 1.5-3z"/>',
   clear: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8l8 8M16 8l-8 8"/>',
@@ -287,12 +292,12 @@ class App {
       if (Math.max(doc.w, doc.h) > this.engine.maxTex) throw new Error(`Canvas ${doc.w}×${doc.h} is larger than this device supports (${this.engine.maxTex}px)`);
       const layers = await Promise.all(doc.layers.map(async (l) => ({
         props: l.props, x: l.offset?.x || 0, y: l.offset?.y || 0,
-        image: await createImageBitmap(new Blob([l.png as unknown as BlobPart], { type: 'image/png' }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }),
+        image: l.png.byteLength ? await createImageBitmap(new Blob([l.png as unknown as BlobPart], { type: 'image/png' }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }) : undefined,
       })));
       await this.autosave.flush();
       this.autosave.detach();
       this.engine.loadDocument(doc.w, doc.h, doc.bg, doc.bgVisible, layers, doc.active);
-      layers.forEach((l) => l.image.close());
+      layers.forEach((l) => l.image?.close());
       this.applyDocExtra(doc.extra || {});
       const now = Date.now();
       const meta: DocMeta = { id: newDocId(), name: doc.name, w: doc.w, h: doc.h, bg: doc.bg, bgVisible: doc.bgVisible, layers: [], active: doc.active, created: now, modified: now };
@@ -309,10 +314,10 @@ class App {
     const e = this.engine;
     // issue every GPU readback first (in GL order), then encode them in the worker as they arrive
     const ls = [...e.layers];
-    const reads = ls.map((l) => e.readLayerAsync(l));
+    const reads = ls.map((l) => (l.group ? Promise.resolve(new Uint8Array(0)) : e.readLayerAsync(l)));
     const mergedP = e.compositePixelsAsync(e.bgVisible);
     const thumbP = e.compositeThumbnail(256);
-    const layers = await Promise.all(ls.map(async (l, i) => ({ props: l.props(), png: await pngEncode(await reads[i], e.w, e.h, true) })));
+    const layers = await Promise.all(ls.map(async (l, i) => ({ props: l.props(), png: l.group ? new Uint8Array(0) : await pngEncode(await reads[i], e.w, e.h, true) })));
     const merged = await pngEncode(await mergedP, e.w, e.h, true);
     const tc = await thumbP;
     const tpx = tc.getContext('2d')!.getImageData(0, 0, tc.width, tc.height).data;
@@ -959,16 +964,31 @@ class App {
     const e = this.engine;
     el.innerHTML = '';
     const max = e.maxLayersFor(e.w, e.h);
-    el.append(h('div', { class: 'pop-head' }, h('b', {}, 'Layers'), h('span', { class: 'muted' }, `${e.layers.length} / ${max}`),
-      h('button', { class: 'ib small', title: 'New layer', onClick: () => { if (!e.addLayer()) this.toast('Layer limit reached for this canvas size'); } }, svg(ICON.plus))));
+    void max;
+    const mem = e.memoryStats();
+    el.append(h('div', { class: 'pop-head' }, h('b', {}, 'Layers'), h('span', { class: 'muted', title: 'GPU memory used by layer pixels' }, `${e.layers.filter((x) => !x.group).length} · ${Math.round(mem.layerBytes / 1048576)} MB`),
+      h('button', { class: 'ib small', title: 'New group', 'aria-label': 'New group', onClick: () => { if (!e.groupActive()) this.toast('Groups nest up to 4 deep'); } }, svg(ICON.folderPlus)),
+      h('button', { class: 'ib small', title: 'New layer', onClick: () => { if (!e.addLayer()) this.toast('Not enough memory for another layer'); } }, svg(ICON.plus))));
     const list = h('div', { class: 'llist' });
+    const folded = (l: Layer) => { for (let p = l.parent; p; p = p.parent) if (p.collapsed) return true; return false; };
     for (let i = e.layers.length - 1; i >= 0; i--) {
       const l = e.layers[i];
+      if (folded(l)) continue;
+      const depth = e.depthOf(l);
+      if (l.group) {
+        const n = e.membersOf(l, true).filter((x) => !x.group).length;
+        const eyeG = h('button', { class: 'ib small', title: l.visible ? 'Hide' : 'Show', onClick: (ev: Event) => { ev.stopPropagation(); e.setProp(l, 'visible', !l.visible); } }, svg(l.visible ? ICON.eye : ICON.eyeOff));
+        const chev = h('button', { class: 'ib small chev', title: l.collapsed ? 'Expand' : 'Collapse', 'aria-label': l.collapsed ? 'Expand group' : 'Collapse group', onClick: (ev: Event) => { ev.stopPropagation(); e.setCollapsed(l, !l.collapsed); this.autosave.touch(); } }, svg(l.collapsed ? ICON.chevRight : ICON.chevDown));
+        list.append(h('div', { class: 'lrow group' + (i === e.active ? ' on' : '') + (e.hiddenInTree(l) ? ' dim' : ''), style: `padding-left:${6 + depth * 16}px`, onClick: () => { e.active = i; this.renderLayers(); } },
+          chev, h('span', { class: 'gicon' }, svg(ICON.folder)),
+          h('div', { class: 'lmeta' }, h('span', { class: 'lname' }, l.name), h('span', { class: 'muted' }, `${n} layer${n === 1 ? '' : 's'}` + (l.blend ? ' · ' + BLEND_MODES[l.blend] : '') + (l.opacity < 1 ? ` · ${Math.round(l.opacity * 100)}%` : ''))), eyeG));
+        continue;
+      }
       const thumb = h('canvas', { width: 72, height: Math.max(24, Math.round(72 * e.h / e.w)), class: 'lthumb', 'data-id': l.id }) as HTMLCanvasElement;
       this.thumbVersions.delete(l.id);
       const eye = h('button', { class: 'ib small', title: l.visible ? 'Hide' : 'Show', onClick: (ev: Event) => { ev.stopPropagation(); e.setProp(l, 'visible', !l.visible); } }, svg(l.visible ? ICON.eye : ICON.eyeOff));
       const tags = h('span', { class: 'tags' }, l.alphaLock ? svg(ICON.lock) : null, l.clip ? svg(ICON.clip) : null);
-      const row = h('div', { class: 'lrow' + (i === e.active ? ' on' : '') + (l.clip ? ' clipped' : ''), onClick: () => { e.active = i; this.renderLayers(); } },
+      const row = h('div', { class: 'lrow' + (i === e.active ? ' on' : '') + (l.clip ? ' clipped' : '') + (e.hiddenInTree(l) ? ' dim' : ''), style: depth ? `padding-left:${6 + depth * 16}px` : '', onClick: () => { e.active = i; this.renderLayers(); } },
         thumb, h('div', { class: 'lmeta' }, h('span', { class: 'lname' }, l.name), h('span', { class: 'muted' }, BLEND_MODES[l.blend] + (l.opacity < 1 ? ` · ${Math.round(l.opacity * 100)}%` : ''))), tags, eye);
       list.append(row);
     }
@@ -992,6 +1012,22 @@ class App {
     const act = (title: string, icon: string, fn: () => void, disabled = false) => h('button', { class: 'ib small', title, 'aria-label': title, disabled, onClick: fn }, svg(icon));
     const name = h('input', { class: 'lname-in', value: l.name }) as HTMLInputElement;
     name.onchange = () => e.setProp(l, 'name', name.value.trim() || l.name);
+    if (l.group) {
+      el.append(h('div', { class: 'lctl' }, name,
+        h('label', { class: 'srow' }, h('span', {}, 'Opacity'), op, opv),
+        h('label', { class: 'srow' }, h('span', {}, 'Blend'), blend),
+        h('div', { class: 'muted small' }, l.opacity >= 1 && !l.blend ? 'Normal 100 %: members blend with everything below' : 'Members are combined first, then blended as one'),
+        h('div', { class: 'acts' },
+          act('Move up', ICON.up, () => e.moveBlock(l, 1), e.blockOf(l)[1] >= e.layers.length - 1 && !l.parent),
+          act('Move down', ICON.down, () => e.moveBlock(l, -1), e.blockOf(l)[0] <= 0 && !l.parent),
+          act('Duplicate group', ICON.copy, () => e.duplicateLayer()),
+          act('Ungroup', ICON.ungroup, () => e.ungroup(l)),
+          act('Flatten group', ICON.flatten, () => e.flattenGroup(l)),
+          act('Delete group', ICON.trash, () => e.deleteBlock(l), e.blockOf(l)[1] - e.blockOf(l)[0] + 1 >= e.layers.length))));
+      this.updateThumbs();
+      return;
+    }
+    const below = e.layers[e.active - 1];
     el.append(h('div', { class: 'lctl' },
       name,
       h('label', { class: 'srow' }, h('span', {}, 'Opacity'), op, opv),
@@ -1000,10 +1036,10 @@ class App {
         tog('Alpha lock', ICON.lock, l.alphaLock, () => e.setProp(l, 'alphaLock', !l.alphaLock)),
         tog('Clipping mask', ICON.clip, l.clip, () => e.setProp(l, 'clip', !l.clip))),
       h('div', { class: 'acts' },
-        act('Move up', ICON.up, () => e.moveLayer(e.active, e.active + 1), e.active >= e.layers.length - 1),
-        act('Move down', ICON.down, () => e.moveLayer(e.active, e.active - 1), e.active <= 0),
-        act('Duplicate', ICON.copy, () => { if (!e.duplicateLayer()) this.toast('Layer limit reached'); }),
-        act('Merge down', ICON.merge, () => e.mergeDown(), e.active <= 0),
+        act('Move up', ICON.up, () => e.moveBlock(l, 1), e.active >= e.layers.length - 1),
+        act('Move down', ICON.down, () => e.moveBlock(l, -1), e.active <= 0 && !l.parent),
+        act('Duplicate', ICON.copy, () => { if (!e.duplicateLayer()) this.toast('Not enough memory for another layer'); }),
+        act('Merge down', ICON.merge, () => e.mergeDown(), !below || below.group || below.parent !== l.parent),
         act('Fill with colour', ICON.fill, () => e.fillLayer(this.state.color)),
         act('Clear', ICON.clear, () => e.clearLayer()),
         act('Delete', ICON.trash, () => e.deleteLayer(), e.layers.length <= 1)),

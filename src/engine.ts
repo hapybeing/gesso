@@ -12,7 +12,9 @@ export interface Dab { x: number; y: number; r: number; a: number; angle: number
 
 let layerSeq = 1;
 const newUid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-export interface LayerProps { uid: string; name: string; visible: boolean; opacity: number; blend: number; alphaLock: boolean; clip: boolean; }
+export interface LayerProps { uid: string; name: string; visible: boolean; opacity: number; blend: number; alphaLock: boolean; clip: boolean;
+  /** layer groups: this entry is a group / uid of the group it sits in / collapsed in the layers panel */
+  group?: boolean; parent?: string | null; collapsed?: boolean; }
 export class Layer implements TiledLayer {
   /** set by the engine: where every layer's pixels live */
   static pool: TilePool;
@@ -25,6 +27,10 @@ export class Layer implements TiledLayer {
   alphaLock = false;
   clip = false;
   version = 0;
+  /** layer groups: a group holds no pixels; its members sit directly below it in the stack (contiguous) */
+  group = false;
+  parent: Layer | null = null;
+  collapsed = false;
   // storage (see tiles.ts): sparse atlas tiles, plus a full working texture while the layer is being edited
   res: Target | null = null;
   tiles = new Map<number, TileRef>();
@@ -36,12 +42,19 @@ export class Layer implements TiledLayer {
   get target(): Target { return Layer.pool.materialise(this); }
   /** replace the pixels with this texture (the previous resident texture now belongs to the caller) */
   set target(t: Target) { Layer.pool.adopt(this, t); }
-  props(): LayerProps { return { uid: this.uid, name: this.name, visible: this.visible, opacity: this.opacity, blend: this.blend, alphaLock: this.alphaLock, clip: this.clip }; }
+  props(): LayerProps {
+    const p: LayerProps = { uid: this.uid, name: this.name, visible: this.visible, opacity: this.opacity, blend: this.blend, alphaLock: this.alphaLock, clip: this.clip };
+    if (this.group) { p.group = true; p.collapsed = this.collapsed; }
+    if (this.parent) p.parent = this.parent.uid;
+    return p;
+  }
 }
 
 export type Tool = 'brush' | 'eraser' | 'smudge';
 /** one compositing step: a layer drawn with an opacity, optional tint (rgb + amount) and clipping base */
-export interface DrawItem { layer: Layer; opacity: number; blend?: number; tint?: [number, number, number, number]; clipBase?: Layer | null; }
+export interface DrawItem { layer: Layer; opacity: number; blend?: number; tint?: [number, number, number, number]; clipBase?: Layer | null;
+  /** an isolated group: these items are composited on their own, then drawn with this item's opacity/blend/tint */
+  children?: DrawItem[]; }
 
 interface StrokeState {
   layer: Layer;
@@ -249,7 +262,8 @@ export class Engine {
     this.history.clear();
     for (const l of this.layers) this.pool.releaseLayer(l);
     this.pool.dispose();
-    for (const t of [this.stroke, this.comp, this.s1, this.s2, this.snapshot]) if (t) freeTarget(gl, t);
+    for (const t of [this.stroke, this.comp, this.s1, this.s2, this.snapshot, ...this.gbuf.flat()]) if (t) freeTarget(gl, t);
+    this.gbuf = [];
     this.snapshot = null;
     if (this.sel) { freeTarget(gl, this.sel); this.sel = null; }
     this.w = w; this.h = h; this.bg = bg; this.bgVisible = true;
@@ -326,13 +340,39 @@ export class Engine {
     bindTarget(gl, src);
     if (withBg) gl.clearColor(this.bg[0], this.bg[1], this.bg[2], 1); else gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
+    const items = this.drawItems();
+    src = this.compositeItems(items, r, src, dst, 0);
+    this.stats.compositePx += r.w * r.h * Math.max(1, items.length);
+    this.mipStale = true;
+    // copy result into comp
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.comp.fb);
+    gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, r.x, r.y, r.x + r.w, r.y + r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    gl.disable(gl.SCISSOR_TEST);
+  }
+
+  private compositeItems(items: DrawItem[], r: Rect, src: Target, dst: Target, depth: number): Target {
+    const gl = this.gl;
     const p = this.pComposite.use();
     this.setStrokeUniforms(p, null);
-    const items = this.drawItems();
     const pool = this.pool;
     type Region = { x: number; y: number; w: number; h: number; lr?: TileRef; cr?: TileRef };
     for (const it of items) {
       const l = it.layer, clipBase = it.clipBase;
+      if (it.children) {
+        // isolated group: its members composited into a transparent buffer pair, then drawn as one layer
+        const [ga, gb] = this.groupBuffers(depth);
+        bindTarget(gl, ga); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+        const res = this.compositeItems(it.children, r, ga, gb, depth + 1);
+        bindTarget(gl, dst);
+        p.use(); this.setStrokeUniforms(p, null);
+        p.i('uActive', 0).i('uClipMode', 0).tex('uClip', 2, null).tex('uPrev', 0, src.tex).tex('uLayer', 1, res.tex).f('uLayerMap', 1, 1, 0, 0)
+          .i('uMode', it.blend ?? l.blend).f('uOpacity', it.opacity);
+        const t = it.tint; p.f('uTint', t ? t[0] : 0, t ? t[1] : 0, t ? t[2] : 0, t ? t[3] : 0);
+        this.drawQuad();
+        const tt = src; src = dst; dst = tt;
+        continue;
+      }
       // resident layers draw in one pass; tiled ones only where they (and their clipping base) have tiles
       const lt = l.res ? null : l.tiles, ct = clipBase && !clipBase.res ? clipBase.tiles : null;
       let regions: Region[] | null = null;
@@ -382,13 +422,13 @@ export class Engine {
       }
       const tt = src; src = dst; dst = tt;
     }
-    this.stats.compositePx += r.w * r.h * Math.max(1, items.length);
-    this.mipStale = true;
-    // copy result into comp
-    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb);
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.comp.fb);
-    gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, r.x, r.y, r.x + r.w, r.y + r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
-    gl.disable(gl.SCISSOR_TEST);
+    return src;
+  }
+  private gbuf: Target[][] = [];
+  /** a full-size buffer pair per group nesting depth (allocated on first use) */
+  private groupBuffers(depth: number): Target[] {
+    if (!this.gbuf[depth]) this.gbuf[depth] = [makeTarget(this.gl, this.w, this.h), makeTarget(this.gl, this.w, this.h)];
+    return this.gbuf[depth];
   }
 
   /**
@@ -398,17 +438,53 @@ export class Engine {
   drawList: DrawItem[] | null = null;
   drawItems(): DrawItem[] {
     if (this.drawList) return this.drawList;
+    return this.buildItems(null);
+  }
+  /** draw items for the members of a group (null = top level), clipping resolved among siblings */
+  buildItems(parent: Layer | null): DrawItem[] {
     const out: DrawItem[] = [];
     let clipBase: Layer | null = null;
     for (const l of this.layers) {
+      if (l.parent !== parent) continue;
+      if (l.group) { clipBase = null; if (l.visible && l.opacity > 0) out.push(...this.groupItems(l)); continue; }
       if (!l.clip) clipBase = l;
-      const clipped = l.clip && clipBase && clipBase !== l;
+      const clipped = l.clip && clipBase && clipBase !== l;   // a layer clipped onto a group draws unclipped
       if (!l.visible || l.opacity <= 0) continue;
       if (clipped && !clipBase!.visible) continue;
       out.push({ layer: l, opacity: l.opacity, clipBase: clipped ? clipBase : null });
     }
     return out;
   }
+  /**
+   * A group as draw items. At Normal 100 % (and untinted) it passes through: its members blend straight onto
+   * what is below, exactly as if ungrouped. Any other opacity, blend or tint isolates it: members are
+   * composited on their own and the result is drawn as one layer (so 50 % fades the group as a whole).
+   */
+  groupItems(g: Layer, opacity = g.opacity, blend = g.blend, tint?: [number, number, number, number]): DrawItem[] {
+    const children = this.buildItems(g);
+    if (!children.length) return [];
+    if (opacity >= 1 && blend === 0 && !tint) return children;
+    return [{ layer: g, opacity, blend, tint, children }];
+  }
+  /** draw items for one layer or group (animation frames, onion skins) */
+  itemsFor(l: Layer, opacity: number, blend: number, tint?: [number, number, number, number], clipBase?: Layer | null): DrawItem[] {
+    if (l.group) return this.groupItems(l, opacity, blend, tint);
+    return [{ layer: l, opacity, blend, tint, clipBase: clipBase ?? null }];
+  }
+  /** members of a group, bottom to top (direct only unless deep) */
+  membersOf(g: Layer, deep = false): Layer[] { return this.layers.filter((l) => deep ? this.isInside(l, g) : l.parent === g); }
+  isInside(l: Layer, g: Layer) { for (let p = l.parent; p; p = p.parent) if (p === g) return true; return false; }
+  depthOf(l: Layer) { let d = 0; for (let p = l.parent; p; p = p.parent) d++; return d; }
+  /** hidden because it or a containing group is hidden */
+  hiddenInTree(l: Layer) { for (let p: Layer | null = l; p; p = p.parent) if (!p.visible) return true; return false; }
+  /** changes whenever anything inside a group (or a layer itself) changes: for thumbnails */
+  contentVersion(l: Layer): number {
+    if (!l.group) return l.version;
+    let v = 7 + this.structVersion * 131;
+    for (const m of this.membersOf(l, true)) v = (v * 31 + m.version + (m.visible ? 1 : 0) + Math.round(m.opacity * 100) * 3 + m.blend * 7) | 0;
+    return v;
+  }
+  structVersion = 0;
 
   viewMatrix(cw: number, ch: number): Float32Array {
     // doc -> css px: rotate+scale then translate; css -> clip
@@ -490,7 +566,7 @@ export class Engine {
   beginStroke(tool: Tool, brush: Brush, color: [number, number, number]) {
     if (this.cur) this.cancelStroke();
     const layer = this.activeLayer;
-    if (!layer) return false;
+    if (!layer || layer.group) return false;
     void layer.target;   // resident while painted
     this.cur = { layer, tool, brush, color, bbox: null, dabs: [], smudgeInit: false };
     const gl = this.gl;
@@ -757,7 +833,7 @@ export class Engine {
     bindTarget(gl, this.thumbT);
     gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    this.pDown.use().tex('uSrc', 0, this.pool.readable(layer).tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
+    this.pDown.use().tex('uSrc', 0, (layer.group ? this.renderGroup(layer) : this.pool.readable(layer)).tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
     bindTarget(gl, this.thumbT);
     this.drawQuad();
     const px = this.readRect(this.thumbT, { x: 0, y: 0, w: tw, h: th });
@@ -775,7 +851,7 @@ export class Engine {
     const gl = this.gl, tw = out.width, th = out.height;
     const t = makeTarget(gl, tw, th);
     const scale = Math.max(this.w / tw, this.h / th);
-    const srcT = this.pool.readable(layer);
+    const srcT = layer.group ? this.renderGroup(layer) : this.pool.readable(layer);
     bindTarget(gl, t); gl.disable(gl.BLEND);
     this.pDown.use().tex('uSrc', 0, srcT.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
     this.drawQuad();
@@ -801,6 +877,8 @@ export class Engine {
 
   private insertLayer(layer: Layer, index: number, label: string) {
     const prevActive = this.active;
+    // membership follows the position: the same group as the layer below (a group header below = beside it)
+    if (!layer.group && !(layer.parent && this.layers[index] === layer.parent)) layer.parent = index > 0 ? this.layers[index - 1]?.parent ?? null : null;
     const doIt = () => { this.layers.splice(index, 0, layer); this.active = index; this.changed(); };
     doIt();
     this.history.push({
@@ -814,20 +892,39 @@ export class Engine {
   addLayer(): Layer | null {
     if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
     const l = new Layer('Layer ' + (Math.max(0, ...this.layers.map((x) => +(x.name.match(/^Layer (\d+)$/)?.[1] ?? 0))) + 1));
-    this.insertLayer(l, this.active + 1, 'New layer');
+    const a = this.activeLayer;
+    // above the active layer, in the same group; on a group: inside it, at the top
+    if (a) l.parent = a.group && !a.collapsed ? a : a.parent;
+    this.insertLayer(l, a && a.group && a.collapsed ? this.blockOf(a)[1] + 1 : this.active + (a && a.group && !a.collapsed ? 0 : 1), 'New layer');
     return l;
   }
 
   duplicateLayer(): Layer | null {
     if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
     const src = this.activeLayer;
+    if (src.group) return this.duplicateGroup(src);
     const l = new Layer(src.name + ' copy', this.copyTarget(src.target));
+    l.parent = src.parent;
     Object.assign(l, { opacity: src.opacity, blend: src.blend, alphaLock: src.alphaLock, clip: src.clip, visible: src.visible });
     this.insertLayer(l, this.active + 1, 'Duplicate layer');
     return l;
   }
 
+  /** copy a group and everything in it, placed above the original */
+  private duplicateGroup(g: Layer): Layer {
+    const [s0, e0] = this.blockOf(g);
+    const map = new Map<Layer, Layer>();
+    const copies = this.layers.slice(s0, e0 + 1).map((x) => {
+      const c = new Layer(x === g ? x.name + ' copy' : x.name, x.group ? null : this.copyTarget(this.pool.readable(x)));
+      Object.assign(c, { opacity: x.opacity, blend: x.blend, alphaLock: x.alphaLock, clip: x.clip, visible: x.visible, group: x.group, collapsed: x.collapsed });
+      map.set(x, c); return c;
+    });
+    for (const [x, c] of map) c.parent = x === g ? g.parent : map.get(x.parent!)!;
+    this.structEdit('Duplicate group', () => { this.layers.splice(e0 + 1, 0, ...copies); this.active = e0 + copies.length; });
+    return map.get(g)!;
+  }
   deleteLayer() {
+    if (this.activeLayer.group) return this.deleteBlock(this.activeLayer);
     if (this.layers.length <= 1) return false;
     const idx = this.active, layer = this.layers[idx];
     const doIt = () => { this.layers.splice(idx, 1); this.active = Math.max(0, idx - 1); this.changed(); };
@@ -864,6 +961,7 @@ export class Engine {
 
   /** clear the layer, or only the selected pixels when there is a selection */
   clearLayer() {
+    if (this.activeLayer.group) return;
     if (this.sel) { this.replaceTarget(this.activeLayer, this.selop(this.activeLayer, 1), 'Clear selection'); return; }
     this.replaceTarget(this.activeLayer, this.newTarget(), 'Clear layer');
   }
@@ -871,6 +969,7 @@ export class Engine {
   /** fill the layer (or the selection) with a colour, honouring alpha lock */
   fillLayer(rgb: [number, number, number]) {
     const layer = this.activeLayer;
+    if (layer.group) return;
     this.replaceTarget(layer, this.selop(layer, 0, rgb), this.sel ? 'Fill selection' : 'Fill layer');
   }
 
@@ -1063,6 +1162,7 @@ export class Engine {
     const i = this.active;
     if (i <= 0) return false;
     const upper = this.layers[i], lower = this.layers[i - 1];
+    if (upper.group || lower.group || lower.parent !== upper.parent) return false;
     const gl = this.gl;
     const t = this.newTarget();
     bindTarget(gl, t);
@@ -1100,6 +1200,130 @@ export class Engine {
     });
     return true;
   }
+
+  // ---------------------------------------------------------------- layer groups (structure edits are undoable snapshots)
+  private structSnap() { return { order: [...this.layers], parents: new Map(this.layers.map((l) => [l, l.parent] as [Layer, Layer | null])), active: this.layers[this.active] }; }
+  private structRestore(s: ReturnType<Engine['structSnap']>) {
+    this.layers = [...s.order];
+    for (const [l, p] of s.parents) l.parent = p;
+    this.active = Math.max(0, this.layers.indexOf(s.active));
+    this.structVersion++;
+    this.changed();
+  }
+  /** apply a structural change (order / membership) as one undo step; removed layers are freed when the step is dropped */
+  structEdit(label: string, fn: () => void) {
+    const before = this.structSnap();
+    fn();
+    this.structVersion++;
+    const after = this.structSnap();
+    this.changed();
+    const gone = before.order.filter((l) => !after.order.includes(l)), added = after.order.filter((l) => !before.order.includes(l));
+    this.history.push({
+      label, bytes: 64 + gone.length * 32,
+      undo: () => this.structRestore(before), redo: () => this.structRestore(after),
+      dispose: (done) => { for (const l of done ? gone : added) this.pool.releaseLayer(l); },
+    });
+  }
+  /** index range [start, end] (inclusive) of a layer or a whole group block in the stack */
+  blockOf(l: Layer): [number, number] {
+    const end = this.layers.indexOf(l);
+    if (!l.group) return [end, end];
+    let start = end;
+    while (start > 0 && this.isInside(this.layers[start - 1], l)) start--;
+    return [start, end];
+  }
+  /** put the active layer (or group) into a new group in its place */
+  groupActive(): Layer | null {
+    const a = this.activeLayer; if (!a) return null;
+    if (this.depthOf(a) >= 4) return null;
+    const g = new Layer('Group ' + (this.layers.filter((l) => l.group).length + 1));
+    g.group = true;
+    this.structEdit('New group', () => {
+      g.parent = a.parent;
+      a.parent = g;
+      const at = this.layers.indexOf(a);
+      this.layers.splice(at + 1, 0, g);
+      this.active = at + 1;
+    });
+    return g;
+  }
+  /** dissolve a group: its members stay where they are */
+  ungroup(g: Layer) {
+    if (!g.group) return;
+    this.structEdit('Ungroup', () => {
+      for (const m of this.membersOf(g)) m.parent = g.parent;
+      const i = this.layers.indexOf(g);
+      this.layers.splice(i, 1);
+      this.active = Math.max(0, i - 1);
+    });
+  }
+  /** delete a layer or a whole group with its contents */
+  deleteBlock(l: Layer) {
+    const [s0, e0] = this.blockOf(l);
+    if (e0 - s0 + 1 >= this.layers.length) return false;
+    this.structEdit(l.group ? 'Delete group' : 'Delete layer', () => { this.layers.splice(s0, e0 - s0 + 1); this.active = Math.max(0, Math.min(this.layers.length - 1, s0 - 1)); });
+    return true;
+  }
+  /**
+   * Move a layer or group block one step up (+1) or down (-1) among the visible structure: past a sibling, into
+   * an expanded sibling group (as its nearest member), or out of its group when it is at the group's edge.
+   */
+  moveBlock(l: Layer, dir: 1 | -1) {
+    const [s0, e0] = this.blockOf(l);
+    const block = this.layers.slice(s0, e0 + 1);
+    this.structEdit('Move layer', () => {
+      const rest = this.layers.filter((x) => !block.includes(x));
+      let at: number;  // insertion index in rest
+      if (dir > 0) {
+        const above = this.layers[e0 + 1];
+        if (!above) return;
+        if (above === l.parent) { l.parent = above.parent; at = rest.indexOf(above) + 1; }               // leave the group upwards
+        else {
+          let unit = above; while (unit.parent !== l.parent) unit = unit.parent!;                         // the sibling (block) above
+          if (unit.group && !unit.collapsed && this.depthOf(unit) < 4) { l.parent = unit; at = rest.indexOf(above); } // enter it as its bottom member
+          else at = rest.indexOf(unit) + 1;                                                                // hop over it
+        }
+      } else {
+        const below = this.layers[s0 - 1];
+        if (!below) return;
+        if (below.parent !== l.parent) {                                                                        // bottom member: leave the group downwards
+          const g = l.parent!; const [gs] = this.blockOf(g); l.parent = g.parent; at = rest.indexOf(this.layers[gs]);
+        } else {
+          // the sibling unit below ends at `below`; find its top (the group header if below is inside a group block)
+          let unit = below; while (unit.parent && unit.parent !== l.parent) unit = unit.parent;
+          if (unit.group && !unit.collapsed && this.depthOf(unit) < 4) { l.parent = unit; at = rest.indexOf(unit); }  // enter as its top member
+          else { const [us] = this.blockOf(unit); at = rest.indexOf(this.layers[us]); }
+        }
+      }
+      rest.splice(at, 0, ...block);
+      this.layers = rest;
+      this.active = this.layers.indexOf(l);
+    });
+  }
+  /** flatten a group into one layer holding exactly what the group shows */
+  flattenGroup(g: Layer): Layer | null {
+    if (!g.group) return null;
+    const gl = this.gl, t = this.newTarget();
+    const res = this.renderGroup(g);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, res.fb); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, t.fb);
+    gl.blitFramebuffer(0, 0, this.w, this.h, 0, 0, this.w, this.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    const flat = new Layer(g.name, t);
+    Object.assign(flat, { opacity: g.opacity, blend: g.blend, visible: g.visible });
+    const [s0, e0] = this.blockOf(g);
+    this.structEdit('Flatten group', () => { flat.parent = g.parent; this.layers.splice(s0, e0 - s0 + 1, flat); this.active = s0; });
+    return flat;
+  }
+  /** a group's contents composited on their own at 100 % (valid until the next composite) */
+  renderGroup(g: Layer): Target {
+    const gl = this.gl, r = { x: 0, y: 0, w: this.w, h: this.h };
+    const [ga, gb] = this.groupBuffers(0);
+    gl.enable(gl.SCISSOR_TEST); gl.scissor(0, 0, this.w, this.h); gl.disable(gl.BLEND);
+    bindTarget(gl, ga); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+    const res = this.compositeItems(this.buildItems(g), r, ga, gb, 1);
+    gl.disable(gl.SCISSOR_TEST);
+    return res;
+  }
+  setCollapsed(g: Layer, c: boolean) { g.collapsed = c; this.onLayersChanged(); }
 
   setProp<K extends 'opacity' | 'blend' | 'alphaLock' | 'clip' | 'visible' | 'name'>(layer: Layer, key: K, value: Layer[K], prev?: Layer[K]) {
     const before = prev !== undefined ? prev : layer[key];
@@ -1177,11 +1401,11 @@ export class Engine {
     const gl = this.gl;
     this.pool.releaseLayer(this.layers[0]);
     this.layers = layers.map(({ props, data, image, tiles, x = 0, y = 0 }) => {
-      if (tiles || (data && data.byteLength === w * h * 4)) {
+      if (tiles || props.group || (data && data.byteLength === w * h * 4)) {
         // straight into atlas tiles: opening a long animation never needs a full texture per frame
         const l = new Layer(props.name);
         if (tiles) for (const [i, d] of tiles) this.pool.writeTile(l, i, d);
-        else this.writeTilesFromFull(l, data!);
+        else if (data) this.writeTilesFromFull(l, data);
         l.tilesVersion = l.version;
         Object.assign(l, { uid: props.uid || l.uid, visible: props.visible, opacity: props.opacity, blend: props.blend, alphaLock: props.alphaLock, clip: props.clip });
         return l;
@@ -1206,6 +1430,10 @@ export class Engine {
       return l;
     });
     if (!this.layers.length) this.layers = [new Layer('Layer 1')];
+    // groups: flags and membership by uid
+    const byUid = new Map(this.layers.map((l) => [l.uid, l]));
+    layers.forEach(({ props }, i) => { const l = this.layers[i]; if (!l) return; l.group = !!props.group; l.collapsed = !!props.collapsed; l.parent = (props.parent && byUid.get(props.parent)) || null; });
+    for (const l of this.layers) if (l.parent && !l.parent.group) l.parent = null;
     this.bgVisible = bgVisible;
     this.active = Math.max(0, Math.min(this.layers.length - 1, active));
     this.markDirty();
@@ -1396,6 +1624,7 @@ export class Engine {
   addLayerRaw(name: string): Layer | null {
     if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
     const l = new Layer(name);
+    l.parent = this.activeLayer?.parent ?? null;
     this.layers.splice(this.active + 1, 0, l); this.active++;
     this.changed();
     return l;

@@ -171,18 +171,23 @@ export async function writeGesso(doc: GessoDoc, encodeImg: (px: Uint8Array, w: n
   const manifest = {
     format: 'gesso', version: 1, app: 'Gesso',
     name: doc.name, width: doc.w, height: doc.h, background: doc.bg, backgroundVisible: doc.bgVisible, active: doc.active,
-    layers: doc.layers.map((l) => ({ ...l.props, blendName: BLEND_MODES[l.props.blend], file: `data/${l.props.uid}.png` })),
+    layers: doc.layers.map((l) => ({ ...l.props, blendName: BLEND_MODES[l.props.blend], file: l.props.group ? undefined : `data/${l.props.uid}.png` })),
     extra: doc.extra || {},
   };
+  // ORA lists top first; groups are nested <stack>s (Normal 100 % groups pass through, as in Gesso)
+  const attrs = (p: LayerProps) => `name="${xmlEsc(p.name)}" x="0" y="0" opacity="${p.opacity.toFixed(3)}" visibility="${p.visible ? 'visible' : 'hidden'}" composite-op="${ORA_OPS[p.blend] || 'svg:src-over'}"`;
+  const level = (parent: string | null, ind: string): string => [...doc.layers].reverse().filter((l) => (l.props.parent ?? null) === parent).map((l) => l.props.group
+    ? `${ind}<stack ${attrs(l.props)}${l.props.opacity >= 1 && !l.props.blend ? ' isolation="auto"' : ' isolation="isolate"'}>\n${level(l.props.uid, ind + ' ')}\n${ind}</stack>`
+    : `${ind}<layer ${attrs(l.props)} src="data/${l.props.uid}.png"${l.props.alphaLock ? ' alpha-preserve="true"' : ''}/>`).join('\n');
   const stack = `<?xml version="1.0" encoding="UTF-8"?>\n<image version="0.0.5" w="${doc.w}" h="${doc.h}">\n <stack>\n` +
-    [...doc.layers].reverse().map((l) => `  <layer name="${xmlEsc(l.props.name)}" src="data/${l.props.uid}.png" x="0" y="0" opacity="${l.props.opacity.toFixed(3)}" visibility="${l.props.visible ? 'visible' : 'hidden'}" composite-op="${ORA_OPS[l.props.blend] || 'svg:src-over'}"${l.props.alphaLock ? ' alpha-preserve="true"' : ''}/>`).join('\n') +
+    level(null, '  ') +
     (doc.bgVisible ? `\n  <layer name="Background" src="data/background.png" x="0" y="0" opacity="1.000" visibility="visible" composite-op="svg:src-over"/>` : '') +
     `\n </stack>\n</image>\n`;
   const entries: ZipEntry[] = [
     { name: 'mimetype', data: enc.encode('image/openraster') },
     { name: 'manifest.json', data: enc.encode(JSON.stringify(manifest, null, 1)), deflate: true },
     { name: 'stack.xml', data: enc.encode(stack), deflate: true },
-    ...doc.layers.map((l) => ({ name: `data/${l.props.uid}.png`, data: l.png })),
+    ...doc.layers.filter((l) => !l.props.group).map((l) => ({ name: `data/${l.props.uid}.png`, data: l.png })),
   ];
   if (doc.bgVisible) {
     // solid background for other apps (Gesso itself reads the colour from manifest.json)
@@ -203,9 +208,10 @@ export async function readGesso(blob: Blob, fallbackName = 'Imported'): Promise<
     const m = JSON.parse(dec.decode(await get('manifest.json')));
     if (m.format !== 'gesso') throw new Error('Not a Gesso file');
     if (m.version > 1) throw new Error('This file was made by a newer Gesso — update the app to open it');
-    const layers = await Promise.all((m.layers as (LayerProps & { file: string })[]).map(async (l) => ({
-      props: { uid: l.uid, name: String(l.name ?? 'Layer'), visible: l.visible !== false, opacity: +l.opacity || 0, blend: Math.max(0, Math.min(BLEND_MODES.length - 1, l.blend | 0)), alphaLock: !!l.alphaLock, clip: !!l.clip },
-      png: await get(l.file),
+    const layers = await Promise.all((m.layers as (LayerProps & { file?: string })[]).map(async (l) => ({
+      props: { uid: l.uid, name: String(l.name ?? 'Layer'), visible: l.visible !== false, opacity: +l.opacity || 0, blend: Math.max(0, Math.min(BLEND_MODES.length - 1, l.blend | 0)), alphaLock: !!l.alphaLock, clip: !!l.clip,
+        group: !!l.group, parent: l.parent ?? null, collapsed: !!l.collapsed },
+      png: l.group || !l.file ? new Uint8Array(0) : await get(l.file),
     })));
     return { name: m.name || fallbackName, w: m.width | 0, h: m.height | 0, bg: m.background || [1, 1, 1], bgVisible: m.backgroundVisible !== false, active: m.active | 0, layers, extra: m.extra || {} };
   }
