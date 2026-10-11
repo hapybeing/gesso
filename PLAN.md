@@ -21,11 +21,13 @@ Known debt: full-canvas textures rather than tiles.
 - [x] Native .gesso format (zip: manifest.json + layer PNGs, also a valid OpenRaster file) export/import; .ora import
 - [x] Image import as layer, with transform box (move, uniform/free scale, rotate, pinch, flip, fit, smooth/sharp, snapping)
 - [x] Shape snapping (hold at stroke end: line, arc, polyline, ellipse/circle, rectangle/square, polygon; rubber-band, finger = perfect, edit handles, Freehand revert)
-- [ ] Selection: freehand, rectangle, ellipse, magic wand; mask-aware painting; invert/feather/clear
-- [ ] Transform: free, uniform, distort, warp-lite; bilinear/bicubic; flip/rotate 90
+- [x] Selection: freehand (+polygon taps), rectangle, ellipse, automatic (wand, live threshold); add/subtract; mask-aware painting/erasing/smudge; invert/feather/fill/clear/copy-paste
+- [x] Transform: uniform + free scale, rotate, pinch, flip, rotate 90, fit; trilinear/bicubic/nearest; selection or whole layer, one undo step
+- [ ] Transform: distort (perspective) and warp
 - [x] Symmetry: vertical, horizontal, quadrant, radial (2–32, mirror or rotational), assisted drawing toggle, draggable/rotatable guide, saved per artwork
 - [ ] Timelapse: record strokes/ops, replay, export WebM/MP4 via MediaRecorder/WebCodecs
-- [ ] Review R2
+- [x] Review R2-lite (part A)
+- [ ] Review R2 (full, incl. part B on device)
 
 ## M3 — Animation
 - [ ] Animation assist: frames = layers/groups, timeline strip, onion skin (count, opacity, colours), FPS, loop/ping-pong/one-shot, hold frames

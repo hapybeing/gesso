@@ -110,7 +110,7 @@ export class Engine {
   private dabBuf!: WebGLBuffer;
   private dabData = new Float32Array(6 * 4096);
   private pComposite!: Program; private pBake!: Program; private pMerge!: Program; private pDab!: Program;
-  private pSmudge!: Program; private pPickup!: Program; private pScreen!: Program; private pDown!: Program; private pPremul!: Program; private pFill!: Program; private pXform!: Program;
+  private pSmudge!: Program; private pPickup!: Program; private pScreen!: Program; private pDown!: Program; private pPremul!: Program; private pFill!: Program; private pXform!: Program; private pMaskOp!: Program; private pBlur!: Program; private pSelop!: Program;
   private shapes = new Map<ShapeId, WebGLTexture>();
   private grains = new Map<GrainId, WebGLTexture>();
   private stroke!: Target;   // coverage buffer
@@ -129,6 +129,9 @@ export class Engine {
   gpuStashBudget = 160 * 1024 * 1024;
   stats: EngineStats = { dabs: 0, compositePx: 0, presents: 0, presentPx: 0 };
   private mipStale = true;
+  /** selection mask (red channel 0..1); null = everything selected */
+  sel: Target | null = null;
+  onSelectionChanged: () => void = () => {};
   onLayersChanged: () => void = () => {};
 
   // view: doc px -> screen css px
@@ -156,13 +159,16 @@ export class Engine {
     this.pPremul = new Program(gl, S.QUAD_VS, S.PREMUL_FS);
     this.pFill = new Program(gl, S.QUAD_VS, S.FILL_FS);
     this.pXform = new Program(gl, S.XFORM_VS, S.XFORM_FS);
+    this.pMaskOp = new Program(gl, S.QUAD_VS, S.MASKOP_FS);
+    this.pBlur = new Program(gl, S.QUAD_VS, S.BLUR_FS);
+    this.pSelop = new Program(gl, S.QUAD_VS, S.SELOP_FS);
 
     const quad = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]);
     this.quadVao = gl.createVertexArray()!;
     gl.bindVertexArray(this.quadVao);
     const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
     // all quad programs bind aPos at location 0
-    for (const p of [this.pComposite, this.pBake, this.pMerge, this.pSmudge, this.pPickup, this.pScreen, this.pDown, this.pPremul, this.pFill, this.pXform]) {
+    for (const p of [this.pComposite, this.pBake, this.pMerge, this.pSmudge, this.pPickup, this.pScreen, this.pDown, this.pPremul, this.pFill, this.pXform, this.pMaskOp, this.pBlur, this.pSelop]) {
       gl.bindAttribLocation(p.prog, 0, 'aPos'); gl.linkProgram(p.prog);
     }
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
@@ -208,6 +214,7 @@ export class Engine {
     this.history.clear();
     for (const t of [this.stroke, this.comp, this.s1, this.s2, this.snapshot]) if (t) freeTarget(gl, t);
     this.snapshot = null;
+    if (this.sel) { freeTarget(gl, this.sel); this.sel = null; }
     this.w = w; this.h = h; this.bg = bg; this.bgVisible = true;
     this.stroke = this.strokeFloat
       ? makeTarget(gl, w, h, { internal: gl.R16F, format: gl.RED, type: gl.HALF_FLOAT })
@@ -260,6 +267,7 @@ export class Engine {
         .i('uAlphaLock', layer!.alphaLock ? 1 : 0);
     } else p.f('uWet', 0).i('uAlphaLock', 0).f('uStrokeOpacity', 0).f('uColor', 0, 0, 0).f('uWetR', 1);
     p.f('uTexel', 1 / this.w, 1 / this.h);
+    p.tex('uSel', 4, this.sel ? this.sel.tex : null).i('uUseSel', this.sel ? 1 : 0);
   }
 
   private clampRect(r: Rect): Rect | null {
@@ -376,7 +384,15 @@ export class Engine {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, zoomedOut ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.view.scale * dpr > 3 ? gl.NEAREST : gl.LINEAR);
     p.i('uComp', 0);
+    p.tex('uSel', 1, this.sel ? this.sel.tex : null).i('uUseSel', this.sel ? 1 : 0).f('uTime', (performance.now() / 1000) % 1000).f('uDpr', dpr);
     this.drawQuad();
+    if (this.sel) this.animateSel();
+  }
+  private selAnim = 0;
+  /** keep the marching ants moving (~30 fps) */
+  private animateSel() {
+    if (this.selAnim) return;
+    this.selAnim = window.setTimeout(() => { this.selAnim = 0; if (this.sel) this.needsPresent = true; }, 33);
   }
 
   // ---------------------------------------------------------------- strokes
@@ -467,7 +483,8 @@ export class Engine {
       bindTarget(gl, this.s1);
       gl.enable(gl.SCISSOR_TEST); gl.scissor(rr.x, rr.y, rr.w, rr.h);
       this.pSmudge.use().tex('uLayer', 0, layer.target.tex).tex('uPick', 1, this.pick[0].tex).tex('uShape', 2, shape)
-        .f('uDocSize', this.w, this.h).f('uDabPos', d.x, d.y).f('uDabR', R).f('uK', Math.min(1, d.a));
+        .f('uDocSize', this.w, this.h).f('uDabPos', d.x, d.y).f('uDabR', R).f('uK', Math.min(1, d.a))
+        .tex('uSel', 4, this.sel ? this.sel.tex : null).i('uUseSel', this.sel ? 1 : 0);
       this.drawQuad();
       gl.disable(gl.SCISSOR_TEST);
       gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.s1.fb);
@@ -735,18 +752,143 @@ export class Engine {
     this.history.push({ label, bytes: this.bytesPerLayer(), undo: swap, redo: swap, dispose: () => held.dispose() });
   }
 
-  clearLayer() { this.replaceTarget(this.activeLayer, this.newTarget(), 'Clear layer'); }
+  /** clear the layer, or only the selected pixels when there is a selection */
+  clearLayer() {
+    if (this.sel) { this.replaceTarget(this.activeLayer, this.selop(this.activeLayer, 1), 'Clear selection'); return; }
+    this.replaceTarget(this.activeLayer, this.newTarget(), 'Clear layer');
+  }
 
+  /** fill the layer (or the selection) with a colour, honouring alpha lock */
   fillLayer(rgb: [number, number, number]) {
     const layer = this.activeLayer;
-    const gl = this.gl;
-    const t = this.newTarget();
-    bindTarget(gl, t);
-    gl.disable(gl.BLEND);
-    this.pFill.use().tex('uLayer', 0, layer.target.tex).f('uColor', ...rgb).i('uLock', layer.alphaLock ? 1 : 0);
-    this.drawQuad();
-    this.replaceTarget(layer, t, 'Fill layer');
+    this.replaceTarget(layer, this.selop(layer, 0, rgb), this.sel ? 'Fill selection' : 'Fill layer');
   }
+
+  /** run SELOP on a layer into a new target */
+  private selop(layer: Layer, mode: 0 | 1 | 2 | 3, rgb: [number, number, number] = [0, 0, 0]): Target {
+    const gl = this.gl, t = this.newTarget();
+    bindTarget(gl, t); gl.disable(gl.BLEND);
+    this.pSelop.use().tex('uLayer', 0, layer.target.tex).tex('uSel', 1, this.sel ? this.sel.tex : null)
+      .i('uUseSel', this.sel ? 1 : 0).i('uMode', mode).i('uLock', layer.alphaLock ? 1 : 0).f('uColor', ...rgb);
+    this.drawQuad();
+    return t;
+  }
+
+  // ---------------------------------------------------------------- selection
+  /** replace the selection mask (null = none), undoably */
+  setSelection(next: Target | null, label: string) {
+    let held: Stash | null = this.sel ? new Stash(this.gl, this.sel, this.stashes) : null;
+    this.sel = next;
+    const swap = () => {
+      const cur = this.sel ? new Stash(this.gl, this.sel, this.stashes) : null;
+      this.sel = held ? held.take() : null;
+      held = cur;
+      this.needsPresent = true; this.onSelectionChanged();
+    };
+    this.history.push({ label, bytes: this.w * this.h * 4, undo: swap, redo: swap, dispose: () => held?.dispose() });
+    this.needsPresent = true; this.onSelectionChanged();
+  }
+  /** combine a coverage texture (alpha, or red when red=true) into the selection */
+  combineSelection(cover: WebGLTexture, mode: 0 | 1 | 2 | 4, label: string, red = false) {
+    const gl = this.gl, t = this.newTarget();
+    bindTarget(gl, t); gl.disable(gl.BLEND);
+    this.pMaskOp.use().tex('uOld', 0, this.sel ? this.sel.tex : null).i('uHasOld', this.sel ? 1 : 0)
+      .tex('uNew', 1, cover).i('uMode', mode).i('uNewRed', red ? 1 : 0);
+    this.drawQuad();
+    this.setSelection(t, label);
+  }
+  /** selection from a 2D canvas the size of the document (white = selected, alpha = coverage) */
+  selectFromCanvas(c: HTMLCanvasElement | OffscreenCanvas, mode: 0 | 1 | 2, label: string) {
+    const gl = this.gl;
+    const tex = textureFromCanvas(gl, c as unknown as TexImageSource, false, false);
+    this.combineSelection(tex, mode, label);
+    gl.deleteTexture(tex);
+  }
+  /** selection from per-pixel coverage bytes (w*h, row 0 = top) */
+  selectFromBytes(cov: Uint8Array, mode: 0 | 1 | 2, label: string) {
+    const gl = this.gl;
+    const tex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, this.w, this.h, 0, gl.RED, gl.UNSIGNED_BYTE, cov);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    this.combineSelection(tex, mode, label, true);
+    gl.deleteTexture(tex);
+  }
+  invertSelection() {
+    const gl = this.gl, t = this.newTarget();
+    bindTarget(gl, t); gl.disable(gl.BLEND);
+    this.pMaskOp.use().tex('uOld', 0, this.sel ? this.sel.tex : null).i('uHasOld', this.sel ? 1 : 0).tex('uNew', 1, null).i('uMode', 3).i('uNewRed', 0);
+    this.drawQuad();
+    this.setSelection(t, 'Invert selection');
+  }
+  deselect() { if (this.sel) this.setSelection(null, 'Deselect'); }
+  selectAll() {
+    const gl = this.gl, t = this.newTarget();
+    bindTarget(gl, t); gl.clearColor(1, 1, 1, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    this.setSelection(t, 'Select all');
+  }
+  /** soften the selection edge by a gaussian of the given radius (doc px) */
+  featherSelection(radius: number) {
+    if (!this.sel || radius <= 0) return;
+    const gl = this.gl;
+    const sigma = radius / 2;
+    const step = Math.max(1, (sigma * 3) / 48), taps = Math.min(64, Math.ceil((sigma * 3) / step));
+    const a = this.newTarget(), b = this.newTarget();
+    gl.disable(gl.BLEND);
+    bindTarget(gl, a);
+    this.pBlur.use().tex('uSrc', 0, this.sel.tex).f('uDir', step / this.w, 0).f('uSigma', sigma / step).i('uTaps', taps);
+    this.drawQuad();
+    bindTarget(gl, b);
+    this.pBlur.use().tex('uSrc', 0, a.tex).f('uDir', 0, step / this.h).f('uSigma', sigma / step).i('uTaps', taps);
+    this.drawQuad();
+    freeTarget(gl, a);
+    this.setSelection(b, 'Feather selection');
+  }
+  /** new layer holding the selected pixels of the active layer */
+  copySelectionToLayer(): Layer | null {
+    if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
+    const src = this.activeLayer;
+    const l = new Layer(src.name + ' (copy)', this.selop(src, 2));
+    this.insertLayer(l, this.active + 1, 'Copy & paste');
+    return l;
+  }
+  /** layer pixels kept outside the selection, and the selected pixels, as new full-size targets */
+  splitBySelection(layer: Layer): { inside: Target; outside: Target | null } {
+    if (!this.sel) return { inside: this.copyTarget(layer.target), outside: null };
+    return { inside: this.selop(layer, 2), outside: this.selop(layer, 3) };
+  }
+  /** bounding box of alpha > 0 in a target (async readback) */
+  async contentBounds(t: Target): Promise<Rect | null> {
+    const px = await new Readback(this.gl, t.fb, 0, 0, this.w, this.h).wait();
+    let x0 = this.w, y0 = this.h, x1 = -1, y1 = -1;
+    const W = this.w;
+    for (let y = 0; y < this.h; y++) {
+      const row = y * W * 4;
+      let any = false;
+      for (let x = 0; x < W; x++) if (px[row + x * 4 + 3] > 1 || px[row + x * 4] > 1) { any = true; if (x < x0) x0 = x; break; }
+      if (!any) continue;
+      for (let x = W - 1; x >= 0; x--) if (px[row + x * 4 + 3] > 1 || px[row + x * 4] > 1) { if (x > x1) x1 = x; break; }
+      if (y < y0) y0 = y; y1 = y;
+    }
+    if (x1 < 0) return null;
+    return { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+  }
+  /** a cropped, mipmapped copy of a rect of any target */
+  sourceFromTarget(t: Target, r: Rect): Target {
+    const gl = this.gl, out = makeTarget(gl, r.w, r.h);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, t.fb);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, out.fb);
+    gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, 0, 0, r.w, r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    this.mipify(out);
+    return out;
+  }
+  /** full-size empty target (public for tools) */
+  blankTarget() { return this.newTarget(); }
+  /** replace a layer's target without history (live previews); returns the old one */
+  swapTarget(layer: Layer, t: Target): Target { const old = layer.target; layer.target = t; layer.version++; this.markDirty(); return old; }
+  freeTarget(t: Target) { freeTarget(this.gl, t); }
 
   mergeDown() {
     const i = this.active;

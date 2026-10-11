@@ -10,6 +10,7 @@ import { readGesso, writeGesso } from './gessofile';
 import { pngEncode } from './workerclient';
 import { ShapeTool } from './shapetool';
 import { TransformTool } from './transformtool';
+import { SelectTool, SelKind } from './selecttool';
 import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
 import type { Shape } from './quickshape';
@@ -59,12 +60,14 @@ const ICON = {
   fill: '<path d="M5 12l7-7 7 7-7 7z"/><path d="M19.5 15.5s1.5 2 1.5 3a1.5 1.5 0 01-3 0c0-1 1.5-3 1.5-3z"/>',
   clear: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8l8 8M16 8l-8 8"/>',
   gallery: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
+  select: '<path d="M4 8V5.5A1.5 1.5 0 015.5 4H8M12 4h2M18 4h.5A1.5 1.5 0 0120 5.5V8M20 12v2M20 18v.5a1.5 1.5 0 01-1.5 1.5H16M12 20h-2M6 20h-.5A1.5 1.5 0 014 18.5V16M4 12v-2"/>',
+  transform: '<path d="M12 3v18M3 12h18"/><path d="M9.5 5.5L12 3l2.5 2.5M9.5 18.5L12 21l2.5-2.5M5.5 9.5L3 12l2.5 2.5M18.5 9.5L21 12l-2.5 2.5"/>',
   symmetry: '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 6.5C5.5 7.5 4 10 4 12.5S6 18 9 17.5z"/><path d="M15 6.5c3.5 1 5 3.5 5 6s-2 5.5-5 5z"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
 };
 
 // ------------------------------------------------------------------ persisted state
-interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; }
+interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; selKind?: string; }
 interface State {
   toolBrush: Record<Tool, string>;
   color: RGB; recent: string[];
@@ -121,6 +124,8 @@ class App {
   sym: Symmetry = defaultSymmetry(1, 1);
   symBar: HTMLElement | null = null;
   xform: TransformTool | null = null;
+  selTool: SelectTool | null = null;
+  selBar: HTMLElement | null = null;
   strokeBrush: Brush | null = null;
 
   constructor() {
@@ -167,7 +172,7 @@ class App {
       const f = [...(ev.clipboardData?.files || [])].find((x) => x.type.startsWith('image/'));
       if (f) { ev.preventDefault(); void this.placeImage(f, 'Pasted image'); }
     });
-    this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); };
+    this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); this.selTool?.invalidateWand(); if (this.selBar) this.renderSelBar(); };
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installEvt = e; });
     this.keys();
     const loop = () => { this.engine.render(); if (this.ovDirty) this.drawOverlay(); requestAnimationFrame(loop); };
@@ -335,7 +340,7 @@ class App {
 
   // ---------------------------------------------------------------- strokes
   /** finish any pending on-canvas edit (shape handles) before another action */
-  settle() { this.shapes.commit(); this.xform?.finish(true); }
+  settle() { this.shapes.commit(); this.xform?.finish(true); this.selTool?.closePoly(); }
 
   captureAt(sx: number, sy: number) {
     if (this.symBar && this.sym.mode !== 'off') {
@@ -446,6 +451,95 @@ class App {
     return this.expand(dabsAlong(b, sh.path(), p, { curve: this.curve, viewScale: this.engine.view.scale, sizeRatio: preset ? b.size / preset.size : 1 }, sh.closed));
   }
 
+  // ---------------------------------------------------------------- selection
+  toggleSelectTool() { if (this.selTool) this.exitSelectTool(); else this.enterSelectTool(); }
+  enterSelectTool() {
+    this.settle(); this.closePop();
+    if (this.symBar) this.toggleSymBar();
+    this.selTool = new SelectTool({
+      engine: this.engine,
+      overlayChanged: () => { this.ovDirty = true; },
+      toast: (m) => this.toast(m),
+      wandPixels: (all) => (all ? this.engine.compositePixelsAsync(false) : this.engine.readLayerAsync(this.engine.activeLayer)),
+    });
+    this.selTool.kind = (this.state.settings.selKind as SelKind) || 'free';
+    this.input.grab = this.selTool;
+    this.selBar = h('div', { id: 'selbar' });
+    document.body.append(this.selBar);
+    this.renderSelBar();
+    $('#bSelect').classList.add('on');
+  }
+  exitSelectTool() {
+    this.selTool?.closePoly();
+    if (this.input.grab === this.selTool) this.input.grab = null;
+    this.selTool = null;
+    this.selBar?.remove(); this.selBar = null;
+    $('#bSelect')?.classList.remove('on');
+    this.ovDirty = true;
+  }
+  renderSelBar() {
+    const bar = this.selBar, st = this.selTool; if (!bar || !st) return;
+    const e = this.engine;
+    bar.innerHTML = '';
+    const chip = (label: string, on: boolean, fn: () => void, disabled = false) => h('button', { class: 'chip' + (on ? ' on' : ''), disabled, onClick: () => { fn(); this.renderSelBar(); } }, label);
+    const kinds: [SelKind, string][] = [['auto', 'Automatic'], ['free', 'Freehand'], ['rect', 'Rectangle'], ['ellipse', 'Ellipse']];
+    bar.append(h('div', { class: 'chips' }, ...kinds.map(([k, l]) => chip(l, st.kind === k, () => { st.cancelPoly(); st.kind = k; this.state.settings.selKind = k; this.save(); }))));
+    bar.append(h('div', { class: 'chips' }, chip('New', st.mode === 0, () => { st.mode = 0; }), chip('Add', st.mode === 1, () => { st.mode = 1; }), chip('Subtract', st.mode === 2, () => { st.mode = 2; }),
+      ...(st.kind === 'auto' ? [chip('All layers', st.sampleAll, () => { st.sampleAll = !st.sampleAll; st.invalidateWand(); })] : []),
+      ...(st.kind === 'free' && st.polyOpen ? [chip('Close shape', false, () => st.closePoly())] : [])));
+    const has = !!e.sel;
+    bar.append(h('div', { class: 'chips' },
+      chip('Invert', false, () => e.invertSelection()),
+      chip('Feather', false, () => this.featherPrompt(), !has),
+      chip('Copy & paste', false, () => { if (!e.copySelectionToLayer()) this.toast('Layer limit reached'); }, !has),
+      chip('Fill', false, () => e.fillLayer(this.state.color), !has),
+      chip('Clear', false, () => e.clearLayer(), !has),
+      chip('Transform', false, () => void this.startLayerTransform(), !has),
+      chip('Deselect', false, () => e.deselect(), !has),
+      h('button', { class: 'btn small', onClick: () => this.exitSelectTool() }, 'Done')));
+  }
+  async featherPrompt() {
+    const v = await ask('Feather selection', { input: '12', okLabel: 'Feather', body: 'Softens the selection edge. Radius in pixels:' });
+    const r = v ? parseFloat(v) : NaN;
+    if (r > 0) this.engine.featherSelection(Math.min(400, r));
+  }
+
+  /** lift the selection (or the whole layer) into the transform box */
+  async startLayerTransform() {
+    this.settle(); this.closePop();
+    const e = this.engine, layer = e.activeLayer;
+    if (!layer.visible) { this.toast('This layer is hidden'); return; }
+    const wasSelecting = !!this.selTool;
+    if (wasSelecting) this.exitSelectTool();
+    const { inside, outside } = e.splitBySelection(layer);
+    const bb = await e.contentBounds(inside);
+    if (!bb) { e.freeTarget(inside); if (outside) e.freeTarget(outside); this.toast(e.sel ? 'Nothing selected on this layer' : 'This layer is empty'); return; }
+    const src = e.sourceFromTarget(inside, bb);
+    e.freeTarget(inside);
+    const maskSrc = e.sel ? e.sourceFromTarget(e.sel, bb) : null;
+    const before = e.stashLayer(layer);
+    const keep = outside;
+    const init = { cx: bb.x + bb.w / 2, cy: bb.y + bb.h / 2, sx: 1, sy: 1, rot: 0 };
+    this.startTransform(layer, src, 'replace', (commit, mat) => {
+      if (commit) {
+        e.history.beginGroup();
+        e.recordReplace(layer, before, 'Transform');
+        if (maskSrc) {
+          const m = e.blankTarget();
+          e.renderTransformed(m, maskSrc, mat, 'smooth');
+          e.setSelection(m, 'Transform');
+        }
+        e.history.endGroup('Transform');
+      } else {
+        const t = before.take();
+        const old = e.swapTarget(layer, t); e.freeTarget(old);
+      }
+      if (keep) e.freeTarget(keep);
+      if (maskSrc) e.freeTarget(maskSrc);
+      if (wasSelecting) this.enterSelectTool();
+    }, init, keep);
+  }
+
   drawOverlay() {
     this.ovDirty = false;
     const c = this.ov, g = c.getContext('2d')!;
@@ -456,6 +550,7 @@ class App {
     drawGuide(g, this.engine, this.sym, !!this.symBar);
     this.shapes.drawOverlay(g);
     this.xform?.drawOverlay(g);
+    this.selTool?.drawOverlay(g);
   }
 
   undo() {
@@ -528,6 +623,8 @@ class App {
       tb('bGallery', ICON.gallery, 'Gallery', () => this.showGallery()),
       h('button', { id: 'bMenu', class: 'brand', onClick: () => this.togglePop('menu', this.renderMenu) }, h('span', { class: 'logo' }), 'Gesso'),
       tb('bExport', ICON.share, 'Export PNG', () => this.exportPNG()),
+      tb('bSelect', ICON.select, 'Select', () => this.toggleSelectTool()),
+      tb('bTransform', ICON.transform, 'Transform', () => void this.startLayerTransform()),
     );
     const right = h('div', { class: 'grp' },
       tb('tBrush', ICON.brush, 'Paint', () => this.pickTool('brush')),
@@ -601,6 +698,7 @@ class App {
 
   pickTool(t: Tool, silent = false) {
     this.settle();
+    if (this.selTool && !silent) this.exitSelectTool();
     const same = this.tool === t;
     this.tool = t;
     for (const [id, tt] of [['tBrush', 'brush'], ['tSmudge', 'smudge'], ['tEraser', 'eraser']] as const) $('#' + id).classList.toggle('on', tt === t);
@@ -1030,13 +1128,13 @@ class App {
     });
   }
 
-  startTransform(layer: Layer, src: Target, mode: 'insert' | 'replace', finish: (commit: boolean) => void, init?: ConstructorParameters<typeof TransformTool>[5]) {
+  startTransform(layer: Layer, src: Target, mode: 'insert' | 'replace', finish: (commit: boolean, m: number[]) => void, init?: ConstructorParameters<typeof TransformTool>[5], keep: Target | null = null) {
     this.input.grab = this.xform = new TransformTool({
       engine: this.engine,
       overlayChanged: () => { this.ovDirty = true; },
       done: () => { this.input.grab = null; this.xform = null; this.ovDirty = true; },
       toast: (m) => this.toast(m),
-    }, layer, src, mode, (commit) => { finish(commit); this.engine.freeSource(src); }, init);
+    }, layer, src, mode, (commit, m) => { finish(commit, m); this.engine.freeSource(src); }, init, keep);
     this.ovDirty = true;
   }
 

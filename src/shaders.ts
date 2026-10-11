@@ -14,6 +14,8 @@ uniform float uWet;
 uniform float uWetR;
 uniform bool uAlphaLock;
 uniform vec2 uTexel;
+uniform sampler2D uSel;       // selection mask (r), active when uUseSel == 1
+uniform int uUseSel;
 float strokeCov(vec2 uv){
   float s = texture(uStroke, uv).r;
   if (uWet > 0.0) {
@@ -25,7 +27,9 @@ float strokeCov(vec2 uv){
     avg *= 0.125;
     s = s * (1.0 - 0.5 * uWet) + uWet * max(0.0, s - avg) * 4.0;
   }
-  return clamp(s, 0.0, 1.0) * uStrokeOpacity;
+  s = clamp(s, 0.0, 1.0) * uStrokeOpacity;
+  if (uUseSel == 1) s *= texture(uSel, uv).r;
+  return s;
 }
 vec4 applyStroke(vec4 L, vec2 uv){
   if (uStrokeMode == 0) return L;
@@ -155,11 +159,13 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uLayer, uPick, uShape;
 uniform vec2 uDocSize, uDabPos; uniform float uDabR, uK;
+uniform sampler2D uSel; uniform int uUseSel;
 void main(){
   vec4 L = texture(uLayer, vUv);
   vec2 l = (vUv * uDocSize - uDabPos) / uDabR;
   if (abs(l.x) > 1.0 || abs(l.y) > 1.0) { o = L; return; }
   float m = texture(uShape, l * 0.5 + 0.5).a * uK;
+  if (uUseSel == 1) m *= texture(uSel, vUv).r;
   o = mix(L, texture(uPick, l * 0.5 + 0.5), m);
 }`;
 
@@ -189,12 +195,26 @@ void main(){
 export const SCREEN_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
-uniform sampler2D uComp;
+uniform sampler2D uComp, uSel;
+uniform int uUseSel; uniform float uTime, uDpr;
 void main(){
   vec4 c = texture(uComp, vUv);
-  vec2 q = floor(gl_FragCoord.xy / 12.0);
+  vec2 q = floor(gl_FragCoord.xy / (12.0 * uDpr));
   float ch = mod(q.x + q.y, 2.0) < 1.0 ? 0.86 : 0.74;
-  o = vec4(c.rgb + vec3(ch) * (1.0 - c.a), 1.0);
+  vec3 col = c.rgb + vec3(ch) * (1.0 - c.a);
+  if (uUseSel == 1) {
+    float m = texture(uSel, vUv).r;
+    // outside the selection: faint moving diagonal stripes
+    float st = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / (14.0 * uDpr) - uTime * 0.25));
+    col = mix(col, col * (0.86 + 0.06 * st), 1.0 - m);
+    // marching ants on the 50 % contour, about 1.3 screen px wide
+    float g = length(vec2(dFdx(m), dFdy(m)));
+    if (g > 1e-4 && abs(m - 0.5) < g * 0.9 * uDpr) {
+      float d = step(0.5, fract((gl_FragCoord.x - gl_FragCoord.y) / (10.0 * uDpr) + uTime * 0.6));
+      col = vec3(d);
+    }
+  }
+  o = vec4(col, 1.0);
 }`;
 
 // 4x4 supersampled downscale copy (thumbnails / export of a single layer)
@@ -269,4 +289,49 @@ void main(){
   vec2 uv = clamp(vUv, 0.5 / uSrcSize, 1.0 - 0.5 / uSrcSize);
   vec4 c = uFilter == 2 ? cubic(uv) : texture(uSrc, uv);
   o = c * aa;
+}`;
+
+// Selection mask combine: uMode 0 replace, 1 add, 2 subtract, 3 invert, 4 intersect. Shape coverage in uNew.a.
+export const MASKOP_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uOld, uNew; uniform int uMode, uHasOld, uNewRed;
+void main(){
+  float a = uHasOld == 1 ? texture(uOld, vUv).r : 0.0;
+  float n = uNewRed == 1 ? texture(uNew, vUv).r : texture(uNew, vUv).a;
+  float r = uMode == 0 ? n : uMode == 1 ? max(a, n) : uMode == 2 ? a * (1.0 - n) : uMode == 3 ? 1.0 - a : a * n;
+  o = vec4(r, r, r, 1.0);
+}`;
+
+// Separable gaussian blur of the mask's red channel (feather). uDir = texel step along one axis.
+export const BLUR_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSrc; uniform vec2 uDir; uniform float uSigma; uniform int uTaps;
+void main(){
+  float acc = texture(uSrc, vUv).r, wsum = 1.0;
+  for (int i = 1; i <= 64; i++) {
+    if (i > uTaps) break;
+    float x = float(i);
+    float w = exp(-0.5 * x * x / (uSigma * uSigma));
+    acc += (texture(uSrc, vUv + uDir * x).r + texture(uSrc, vUv - uDir * x).r) * w;
+    wsum += 2.0 * w;
+  }
+  float r = acc / wsum;
+  o = vec4(r, r, r, 1.0);
+}`;
+
+// Layer edits restricted by the selection: uMode 0 fill colour (optionally alpha-locked), 1 clear,
+// 2 keep only selected (layer * m), 3 keep only unselected (layer * (1 - m)).
+export const SELOP_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uLayer, uSel; uniform int uMode, uLock, uUseSel; uniform vec3 uColor;
+void main(){
+  vec4 L = texture(uLayer, vUv);
+  float m = uUseSel == 1 ? texture(uSel, vUv).r : 1.0;
+  if (uMode == 0) { float a = uLock == 1 ? L.a : 1.0; o = mix(L, vec4(uColor * a, a), m); }
+  else if (uMode == 1) o = L * (1.0 - m);
+  else if (uMode == 2) o = L * m;
+  else o = L * (1.0 - m);
 }`;

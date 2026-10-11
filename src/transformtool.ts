@@ -30,7 +30,7 @@ export class TransformTool implements Grab {
   private bar: HTMLElement;
   private raf = 0;
 
-  constructor(private host: TransformHost, readonly layer: Layer, readonly src: Target, private mode: 'insert' | 'replace', private onFinish: (commit: boolean) => void, init?: Xf) {
+  constructor(private host: TransformHost, readonly layer: Layer, readonly src: Target, private mode: 'insert' | 'replace', private onFinish: (commit: boolean, m: number[]) => void, init?: Xf, private keep: Target | null = null) {
     const e = host.engine;
     if (init) this.xf = { ...init };
     else {
@@ -63,7 +63,7 @@ export class TransformTool implements Grab {
   private apply() {
     cancelAnimationFrame(this.raf);
     this.raf = requestAnimationFrame(() => {
-      this.host.engine.renderTransformed(this.layer.target, this.src, this.matrix(), this.filter);
+      this.host.engine.renderTransformed(this.layer.target, this.src, this.matrix(), this.filter, this.keep);
       this.layer.version++;
     });
     this.host.overlayChanged();
@@ -204,12 +204,15 @@ export class TransformTool implements Grab {
   }
   reset() { this.xf = { ...this.start }; this.apply(); }
 
+  private finished = false;
   finish(commit: boolean) {
+    if (this.finished) return;
+    this.finished = true;
     cancelAnimationFrame(this.raf);
-    if (commit) { this.host.engine.renderTransformed(this.layer.target, this.src, this.matrix(), this.filter); this.layer.version++; }
+    if (commit) { this.host.engine.renderTransformed(this.layer.target, this.src, this.matrix(), this.filter, this.keep); this.layer.version++; }
     this.bar.remove();
-    this.onFinish(commit);
     this.host.done(commit);
+    this.onFinish(commit, this.matrix());
   }
 
   private renderBar() {

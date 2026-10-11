@@ -14,7 +14,23 @@ export class History {
   maxSteps = 120;
   onChange: () => void = () => {};
 
+  private group: Entry[] | null = null;
+  /** collect the following pushes into one undo step */
+  beginGroup() { this.group = []; }
+  endGroup(label: string) {
+    const g = this.group; this.group = null;
+    if (!g || !g.length) return;
+    if (g.length === 1) { this.push({ ...g[0], label }); return; }
+    this.push({
+      label, bytes: g.reduce((s, e) => s + e.bytes, 0),
+      undo: () => { for (let i = g.length - 1; i >= 0; i--) g[i].undo(); },
+      redo: () => { for (const e of g) e.redo(); },
+      dispose: (done) => { for (const e of g) e.dispose?.(done); },
+    });
+  }
+
   push(e: Entry) {
+    if (this.group) { this.group.push(e); return; }
     // drop redo branch
     for (const x of this.list.splice(this.idx)) x.dispose?.(false);
     this.list.push(e);
