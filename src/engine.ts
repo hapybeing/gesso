@@ -1661,6 +1661,16 @@ export class Engine {
   stashLayer(layer: Layer): Stash { return this.stashRect(layer.target, { x: 0, y: 0, w: this.w, h: this.h }); }
   freeSource(t: Target) { freeTarget(this.gl, t); }
 
+  // ---------------------------------------------------------------- helpers for filter modules (adjust.ts)
+  quad() { this.drawQuad(); }
+  program(fs: string, vs = S.QUAD_VS): Program {
+    const p = new Program(this.gl, vs, fs);
+    this.gl.bindAttribLocation(p.prog, 0, 'aPos'); this.gl.linkProgram(p.prog);
+    return p;
+  }
+  copyOfLayer(l: Layer): Target { return this.copyTarget(l.target); }
+  newStash(t: Target): Stash { return new Stash(this.gl, t, this.stashes); }
+  layerChanged(l: Layer) { l.version++; this.markDirty(); }
   /** debugging/testing helper: average alpha of a layer region */
   layerPixels(layer: Layer, r: Rect) { return this.readRect(layer.target, r); }
   // keep makeTexture referenced for tree-shaking stability

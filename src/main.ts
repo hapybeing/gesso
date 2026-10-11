@@ -5,6 +5,7 @@ import { Input, StylusMode } from './input';
 import { pressureSection } from './pressureui';
 import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
+import { AdjustUI } from './adjustui';
 import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
 import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
@@ -61,6 +62,7 @@ const ICON = {
   transform: '<path d="M12 3v18M3 12h18"/><path d="M9.5 5.5L12 3l2.5 2.5M9.5 18.5L12 21l2.5-2.5M5.5 9.5L3 12l2.5 2.5M18.5 9.5L21 12l-2.5 2.5"/>',
   film: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/>',
   symmetry: '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 6.5C5.5 7.5 4 10 4 12.5S6 18 9 17.5z"/><path d="M15 6.5c3.5 1 5 3.5 5 6s-2 5.5-5 5z"/>',
+  adjust: '<path d="M4 20l10-10"/><path d="M15.5 4.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/><path d="M19.5 11l.4 1 1 .4-1 .4-.4 1-.4-1-1-.4 1-.4z"/><path d="M14 10l-2-2"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
 };
 
@@ -123,6 +125,7 @@ class App {
   symBar: HTMLElement | null = null;
   xform: TransformTool | null = null;
   selTool: SelectTool | null = null;
+  adj!: AdjustUI;
   selBar: HTMLElement | null = null;
   strokeBrush: Brush | null = null;
   tl: TimelapseRecorder;
@@ -168,7 +171,9 @@ class App {
     this.autosave = new Autosave(this.engine);
     this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
     this.autosave.extra = () => this.docExtra();
-    this.autosave.blocked = () => !!this.xform || this.shapes.active;
+    this.adj = new AdjustUI({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), overlayChanged: () => { this.ovDirty = true; },
+      changed: () => { $('#bAdjust')?.classList.toggle('on', this.adj.active); this.updateUndoButtons(); } });
+    this.autosave.blocked = () => !!this.xform || this.shapes.active || this.adj.active;
     this.anim = new Animator({
       engine: this.engine,
       toast: (m) => this.toast(m),
@@ -179,7 +184,7 @@ class App {
     });
     this.tl = new TimelapseRecorder(this.engine);
     this.tl.list = () => this.anim.captureList();
-    this.tl.blocked = () => !!this.xform || this.shapes.active;
+    this.tl.blocked = () => !!this.xform || this.shapes.active || this.adj.active;
     this.autosave.onAttach = (meta, clean) => {
       const x = (meta.extra?.timelapse || {}) as { on?: boolean };
       this.tl.attach(meta.id, x.on !== false);
@@ -364,7 +369,7 @@ class App {
 
   // ---------------------------------------------------------------- strokes
   /** finish any pending on-canvas edit (shape handles) before another action */
-  settle() { this.shapes.commit(); this.xform?.finish(true); this.selTool?.closePoly(); }
+  settle() { this.shapes.commit(); this.xform?.finish(true); this.selTool?.closePoly(); if (this.adj?.active) this.adj.close(true); }
 
   captureAt(sx: number, sy: number) {
     if (this.symBar && this.sym.mode !== 'off') {
@@ -601,9 +606,11 @@ class App {
     this.shapes.drawOverlay(g);
     this.xform?.drawOverlay(g);
     this.selTool?.drawOverlay(g);
+    this.adj?.drawOverlay(g);
   }
 
   undo() {
+    if (this.adj.active) { this.adj.close(false); this.toast('Adjustment cancelled'); return; }
     if (this.edgeAdj) this.closeEdgeAdjust(false);
     if (this.shapes.active) { this.shapes.cancel(); this.toast('Undo shape'); return; }
     if (this.engine.stroking) return; const l = this.engine.history.undo(); this.toast(l ? 'Undo ' + l.toLowerCase() : 'Nothing to undo'); }
@@ -678,6 +685,7 @@ class App {
       tb('bExport', ICON.share, 'Export PNG', () => this.exportPNG()),
       tb('bSelect', ICON.select, 'Select', () => this.toggleSelectTool()),
       tb('bTransform', ICON.transform, 'Transform', () => void this.startLayerTransform()),
+      tb('bAdjust', ICON.adjust, 'Adjustments', () => this.togglePop('adjust', (el) => this.adj.renderMenu(el, () => this.closePop()))),
     );
     const right = h('div', { class: 'grp' },
       tb('tBrush', ICON.brush, 'Paint', () => this.pickTool('brush')),

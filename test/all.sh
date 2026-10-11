@@ -1,15 +1,16 @@
 #!/bin/sh
 # Run the browser tests; fail if any reports console errors or exits non-zero.
 # The whole suite takes ~4 min under SwiftShader, so it is split into groups that each fit a 2-minute shell:
-#   test/all.sh 1 … test/all.sh 5      (no argument = everything)
+#   test/all.sh 1 … test/all.sh 6      (no argument = everything)
 cd "$(dirname "$0")/.." || exit 1
 case "$1" in
   1) set -- run r1 m2 gessofile ;;
   2) set -- quickshape symmetry transform selection ;;
   3) set -- bigdoc timelapse ;;
   4) set -- warp anim ;;
-  5) set -- tiles groups ;;
-  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups ;;
+  5) set -- tiles ;;
+  6) set -- groups adjust ;;
+  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust ;;
 esac
 fail=0
 [ "$1" = run ] && { node test/quickshape-unit.cjs | tail -1 || fail=1; }
