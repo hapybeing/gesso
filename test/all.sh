@@ -1,15 +1,17 @@
 #!/bin/sh
 # Run the browser tests; fail if any reports console errors or exits non-zero.
-# The whole suite takes ~4 min under SwiftShader, so it is split into groups that each fit a 2-minute shell:
-#   test/all.sh 1 … test/all.sh 6      (no argument = everything)
+# The whole suite takes ~9 min under SwiftShader, so it is split into groups that each fit a 2-minute shell:
+#   test/all.sh 1 … test/all.sh 8      (no argument = everything)
 cd "$(dirname "$0")/.." || exit 1
 case "$1" in
   1) set -- run r1 m2 gessofile ;;
   2) set -- quickshape symmetry transform selection ;;
-  3) set -- bigdoc timelapse ;;
-  4) set -- warp anim ;;
-  5) set -- tiles ;;
-  6) set -- groups adjust wet feel text ;;
+  3) set -- bigdoc ;;
+  4) set -- timelapse warp ;;
+  5) set -- anim ;;
+  6) set -- tiles ;;
+  7) set -- groups adjust wet ;;
+  8) set -- feel text ;;
   *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust wet feel text ;;
 esac
 fail=0

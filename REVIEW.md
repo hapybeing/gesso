@@ -105,3 +105,36 @@ Still open (device-only checks, can't be done headless): pen/finger feel of the 
 ## R3 — M3 review (2026-10-12)
 Whole suite green in four groups (`test/all.sh 1`…`4`): every test exits 0 with no console errors or warnings. tsc clean, build clean. A timed-out test used to leave its Chromium running (41 orphaned processes slowed later runs to a crawl) → all.sh now kills them on timeout.
 **Known limits / next:** frame count is bounded by GPU memory (each frame is a full-canvas layer: ~60 frames at 1080p, fewer on big canvases — tiled/compressed off-screen frames would lift this); holds and frame roles are saved with the artwork but are not undo steps; hidden layers are left out of the animation; GIF timing tops out at 50 fps and its transparency is 1-bit; no audio track or layer groups as frames; MP4 uses variable frame durations (holds as long samples), which every player handles but some editors re-time; playback smoothness and encoder choice still need a check on the user's tablet (SwiftShader manages only ~6 display fps at 1080p).
+# M4 notes (scratch for REVIEW)
+## Tiles
+- 48 frames 1080p ball: whole-layer 379.7 MB -> 23.9 MB (63 tiles, 1 page + 1 resident); capacity under 560 MB budget: 66 -> ~1549 frames
+- 4096² 16 layers each one dab: 1024 MB whole (old cap 4 layers) -> 96 MB
+- composite hash identical resident vs tiled; undo/redo across eviction restores exactly
+- autosave: stroke on 4096² doc writes 4 tiles / 18.8 KB / 82-136 ms (before: whole 64 MB layer readback + deflate). bigdoc 3840x2160x5: save-all 778 ms longest task 67 ms (was 3.9 s / 2.7 s task); single stroke 5 tiles 22.6 KB.
+- bugs found: reduce pass maxed alpha=1 of r1 (every tile looked used) -> output vec4(m); materialise inside draw setup clobbered FB/texture bindings (feedback loop warning, selection fill broken) -> save/restore GL state; canGrow counted transient residents -> atlas + 2 working layers; bursts making many residents -> sync LRU eviction under pressure.
+- SwiftShader: first sync point absorbs the CPU raster backlog (2.2 s drain measured with nothing but a fill pending), so the eviction now carries the long task the first save used to.
+- 24 layers @4096² crashed headless SwiftShader during first save (host memory); 16 fine.
+## Groups
+- flat stack + parent pointers, contiguous blocks [members..., header]; Normal 100% = pass-through, else isolated (per-depth full buffer pair, lazy)
+- measured: isolated 50% group over red at overlap = (130,0,125) vs two 50% layers (84,0,171): group fades as a whole; flatten == live isolated (146,0,109 both)
+- move in/out (edge leave, expanded sibling enter), nest 4 deep, collapse, ungroup, flatten, duplicate deep, delete+undo, autosave reload + .gesso round trip (nested ORA <stack isolation>), groups as animation frames (onion/thumbnail via renderGroup, contentVersion)
+- bugs while testing: test rings vs discs (sample point), reload needed goto(url)
+## Adjustments
+- session keeps original; preview = filter(original) (no accumulation); Apply = one undo (recordReplace with stash of original); Cancel bit-exact (sig equal); selection-limited (inside desat 230->gray, outside unchanged)
+- HSB: hue 180 on orange (230,120,40) -> (40,150,230); refinement: sat pivoted on luma (desat -> 144 grey, was HSV 230 = brightness jump); 
+- curves: monotone cubic (Fritsch-Carlson) LUT, master then per channel; invert curve -> 25 exact; midpoint lift 128->192
+- gradient map 6 presets; blur separable gaussian (sigma=r/2, <=97 taps via stride); sharpen unsharp mask; noise sd 25 at 40%, mono
+- liquify: displacement field packed 2x16-bit fixed point in RGBA8 (no float RT needed), push/twirl cw/ccw/pinch/expand/restore, scissored per dab, push split into r/4 steps, pressure, held modes repeat at 30 Hz; bar of 10 px pushed 40 px right
+## Wet media
+- after lift, wet brushes (Wet Wash 0.8, Round Sable 0.45, Bleed Bloom 1) run a drying sim over the stroke bbox+bleed: RGBA16F field (suspended pigment, water, deposited, initial wetness); 26+26*wet steps, 2 per frame (~0.4-0.9 s at 60 fps), then the normal bake (one undo step). New stroke / undo / cancel settle instantly.
+- model: water diffuses in wet area, wicks into dry paper only along fibres (g^2), evaporates 4x faster at the wet front; pigment flux between wet cells along water gradient (conserving) -> rim; pigment diffusion inside wet; deposition as water leaves, granulation into grain valleys.
+- iteration: v1 water spread far + pigment raced to the front -> pale halo with hard outline; v2 gated flux to wet cells; v3 wetness from coverage smoothstep(0.08,0.7) (faint fringe not wet), flow 0.85, pigment diffusion 0.45 -> soft dark rim, granulated interior.
+- measured cross-section (alpha): dry rim/mid 121/145; wet 160/142 (edge darker than centre); interior texture sd 21 -> 26.7 (granulation); width 79 -> 81 (slight bleed)
+## Feel round 2
+- predicted tip: overlay path last drawn dab -> latest raw pen pos (closes smoothing lag) -> getPredictedEvents; brush colour/width; never in pixels; cleared on lift; off for smudge/eraser/symmetry/hold. Test: overlay alpha 255 30 px ahead, 0 beyond, 0 after lift, canvas untouched there; 40 px average horizon in the synthetic test (prediction 20/40 px ahead).
+- .gessobrush JSON (format/version/brushes), validated + clamped (size 1e9 -> 1000, bad shape -> default, unknown keys dropped), Imported group in localStorage, Import/Export in brush library; 601 bytes per brush
+- colour: harmony modes (complementary/analogous/triadic/split/tetradic/shades) with ring markers + swatches; History palette (18 painted colours)
+- stylus & palm test page (Settings): rates, samples/event, event age, predicted %, pressure quantiles + histogram, tilt, palm rejections/contact area, advice, copy/download JSON log
+## Text + reference
+- text: T button / menu; tap places, textarea live preview, fonts Sans/Serif/Mono (system) + bundled OFL Caveat (74 KB woff2, Latin subset) and Bebas Neue (13 KB), size/line/spacing, align keeps the box, bold/italic, drag on canvas to move, Done = one undo step, layer named from text; stays editable while unpainted (Layers -> Edit text), edit undo/redo swaps specs (refinement: first cut lost editability after undoing an edit); persisted via props (autosave, .gesso manifest)
+- reference: floating draggable/resizable window, Canvas mode (live async thumbnail, refreshed when versions change, 400 ms poll) or Image mode (drag/pinch/wheel zoom, double-tap fit), Pick colour; position remembered
