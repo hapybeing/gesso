@@ -20,11 +20,11 @@ export const CODECS = {
 };
 
 /** first supported encoder config among the codec families, in order */
-export async function pickEncoder(w: number, h: number, families: ('avc' | 'vp9' | 'vp8')[], bitrate = 0): Promise<VideoEncoderConfig | null> {
+export async function pickEncoder(w: number, h: number, families: ('avc' | 'vp9' | 'vp8')[], bitrate = 0, latency: 'quality' | 'realtime' = 'quality'): Promise<VideoEncoderConfig | null> {
   if (!hasWebCodecs()) return null;
   const br = bitrate || Math.round(Math.min(12e6, Math.max(1.5e6, w * h * 30 * 0.12)));
   for (const f of families) for (const codec of CODECS[f](w, h)) {
-    const cfg: VideoEncoderConfig = { codec, width: w, height: h, bitrate: br, framerate: 30, latencyMode: 'quality' };
+    const cfg: VideoEncoderConfig = { codec, width: w, height: h, bitrate: br, framerate: 30, latencyMode: latency };
     if (f === 'avc') (cfg as any).avc = { format: 'avc' };
     try { const s = await VideoEncoder.isConfigSupported(cfg); if (s.supported) return cfg; } catch { /* try next */ }
   }

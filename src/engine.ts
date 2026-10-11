@@ -688,7 +688,7 @@ export class Engine {
     bindTarget(gl, this.thumbT);
     gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0);
+    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
     this.drawQuad();
     const px = this.readRect(this.thumbT, { x: 0, y: 0, w: tw, h: th });
     const img = new ImageData(tw, th);
@@ -1111,7 +1111,7 @@ export class Engine {
     gl.disable(gl.BLEND);
     gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    this.pDown.use().tex('uSrc', 0, src.tex).f('uStep', 1 / tw, 1 / th).f('uOver', 0, 0, 0, 0);
+    this.pDown.use().tex('uSrc', 0, src.tex).f('uStep', 1 / tw, 1 / th).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
     this.drawQuad();
     const px = await new Readback(gl, t.fb, 0, 0, tw, th).wait();
     freeTarget(gl, t);
@@ -1148,10 +1148,12 @@ export class Engine {
     bindTarget(gl, this.capT);
     gl.disable(gl.BLEND);
     gl.bindTexture(gl.TEXTURE_2D, this.comp.tex);
-    // the 4×4 supersampled pass alone is a good box filter down to 1/4 scale; mips only below that
-    if (ow * 4 < this.w || oh * 4 < this.h) { if (this.mipStale) { gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false; } gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    // down to 1/2 scale four bilinear taps are an exact box filter (cheap enough to run on every step);
+    // below that, mips + the 4×4 grid
+    const small = ow * 2 < this.w || oh * 2 < this.h;
+    if (small) { if (this.mipStale) { gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false; } gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
     else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    this.pDown.use().tex('uSrc', 0, this.comp.tex).f('uStep', 1 / ow, 1 / oh).f('uOver', flat ? flat[0] : 0, flat ? flat[1] : 0, flat ? flat[2] : 0, flat ? 1 : 0);
+    this.pDown.use().tex('uSrc', 0, this.comp.tex).f('uStep', 1 / ow, 1 / oh).f('uOver', flat ? flat[0] : 0, flat ? flat[1] : 0, flat ? flat[2] : 0, flat ? 1 : 0).i('uTaps', small ? 4 : 2);
     this.drawQuad();
     return new Readback(gl, this.capT.fb, 0, 0, ow, oh).wait();
   }

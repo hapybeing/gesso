@@ -233,10 +233,11 @@ class App {
         newCanvas: () => this.showNewCanvas(false),
         importFile: () => this.importGessoFile(),
         exportFile: (id) => void this.exportGessoFile(id),
-        duplicate: async (id) => { const m = await store.get(id); if (m) await store.duplicate(id, newDocId(), m.name + ' copy'); },
+        duplicate: async (id) => { if (this.tl.docId === id) await this.tl.flush(); const m = await store.get(id); if (m) await store.duplicate(id, newDocId(), m.name + ' copy'); },
         remove: async (id) => {
+          // stop recording first so no time-lapse pack lands after the delete
+          if (this.autosave.docId === id) { this.autosave.detach(); localStorage.removeItem('gesso.last'); await this.tl.idle(); }
           await store.remove(id);
-          if (this.autosave.docId === id) { this.autosave.detach(); localStorage.removeItem('gesso.last'); }
         },
         rename: async (id, name) => {
           if (this.autosave.docId === id && this.autosave.meta) { this.autosave.meta.name = name; await this.autosave.flush(); }

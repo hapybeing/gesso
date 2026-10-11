@@ -134,7 +134,8 @@ export class TimelapseRecorder {
   private async init() {
     const e = this.engine;
     if (!this.w) { const v = evenFit(e.w, e.h, 1920, 1080); this.w = v.w; this.h = v.h; }
-    const cfg = await pickEncoder(this.w, this.h, ['avc', 'vp9', 'vp8'], Math.round(Math.min(10e6, Math.max(2e6, this.w * this.h * 3))));
+    // realtime mode: far less CPU per frame (battery), at a slightly larger size per step
+    const cfg = await pickEncoder(this.w, this.h, ['avc', 'vp9', 'vp8'], Math.round(Math.min(10e6, Math.max(2e6, this.w * this.h * 3))), 'realtime');
     if (cfg) {
       this.kind = 'video'; this.encCfg = cfg; this.decCfg = null; this.segFrames = 0;
       this.enc = new VideoEncoder({
@@ -182,6 +183,9 @@ export class TimelapseRecorder {
     if (this.enc) { try { await this.enc.flush(); } catch { /* closed */ } }
     await this.persistNow(this.docId);
   }
+
+  /** resolves once a detached document's last frames have been written */
+  async idle() { await this.ready; await this.persistChain; }
 
   /** delete the recording of the current document */
   async purge() {

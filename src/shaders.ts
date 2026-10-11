@@ -224,11 +224,18 @@ export const DOWNSAMPLE_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uSrc; uniform vec2 uStep; uniform vec4 uOver; // uOver.a = 1: flatten onto uOver.rgb
+uniform int uTaps; // 4: 4×4 grid (any scale with mips); 2: 2×2 bilinear taps (an exact box filter at 1/2 scale)
 void main(){
   vec4 acc = vec4(0.0);
-  for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++)
-    acc += texture(uSrc, vUv + (vec2(float(x), float(y)) - 1.5) * uStep * 0.25);
-  o = acc / 16.0;
+  if (uTaps == 2) {
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 2; x++)
+      acc += texture(uSrc, vUv + (vec2(float(x), float(y)) - 0.5) * uStep * 0.5);
+    o = acc / 4.0;
+  } else {
+    for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++)
+      acc += texture(uSrc, vUv + (vec2(float(x), float(y)) - 1.5) * uStep * 0.25);
+    o = acc / 16.0;
+  }
   if (uOver.a > 0.5) o = vec4(o.rgb + uOver.rgb * (1.0 - o.a), 1.0);
 }`;
 
