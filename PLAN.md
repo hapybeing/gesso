@@ -17,7 +17,7 @@ Known debt: full-canvas textures rather than tiles.
 - [x] UI polish: one-handed reach, sidebar size/opacity sliders, quick undo button, 44px targets
 
 ## M2 — Workflow
-- [ ] IndexedDB autosave (debounced, per-layer dirty tiles) + Gallery (thumbnails, new/duplicate/delete/rename, canvas presets)
+- [x] IndexedDB autosave (debounced, per-layer dirty layers, bit-exact) + Gallery (thumbnails, new/duplicate/delete/rename, canvas presets); opens to last artwork; beforeunload nag removed
 - [ ] Native .gesso format (zip: manifest.json + layer PNGs) save/load; PSD-free
 - [ ] Image import as layer, with transform
 - [ ] QuickShape (hold at stroke end: line, ellipse, rectangle, polyline; edit handles)

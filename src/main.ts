@@ -3,6 +3,9 @@ import { BRUSHES, Brush, SHAPES, GRAINS, makeShape, ShapeId } from './brushes';
 import { StrokeBuilder, Sample, PressureCurve } from './stroke';
 import { Input, StylusMode } from './input';
 import { pressureSection } from './pressureui';
+import { store, newDocId, DocMeta } from './store';
+import { Autosave, loadDocPixels } from './autosave';
+import { Gallery, ask } from './gallery';
 import { RGB, HSV, hsvToRgb, rgbToHsv, toHex, fromHex } from './color';
 
 // ------------------------------------------------------------------ helpers
@@ -46,6 +49,7 @@ const ICON = {
   down: '<path d="M12 5v14M6 13l6 6 6-6"/>',
   fill: '<path d="M5 12l7-7 7 7-7 7z"/><path d="M19.5 15.5s1.5 2 1.5 3a1.5 1.5 0 01-3 0c0-1 1.5-3 1.5-3z"/>',
   clear: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8l8 8M16 8l-8 8"/>',
+  gallery: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
 };
 
@@ -63,7 +67,7 @@ const DEFAULT_STATE: State = {
   settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true },
   overrides: {},
 };
-const store = {
+const prefs = {
   load(): State {
     try { const s = JSON.parse(localStorage.getItem('gesso.v1') || '{}'); return { ...DEFAULT_STATE, ...s, settings: { ...DEFAULT_STATE.settings, ...(s.settings || {}) }, toolBrush: { ...DEFAULT_STATE.toolBrush, ...(s.toolBrush || {}) } }; }
     catch { return structuredClone(DEFAULT_STATE); }
@@ -71,8 +75,8 @@ const store = {
   timer: 0 as number,
   save(s: State) {
     // debounced: sliders call this on every move
-    clearTimeout(store.timer);
-    store.timer = window.setTimeout(() => { try { localStorage.setItem('gesso.v1', JSON.stringify(s)); } catch { /* quota */ } }, 250);
+    clearTimeout(prefs.timer);
+    prefs.timer = window.setTimeout(() => { try { localStorage.setItem('gesso.v1', JSON.stringify(s)); } catch { /* quota */ } }, 250);
   },
 };
 
@@ -84,7 +88,7 @@ const PALETTE = ['#1d1b19', '#4a4038', '#8c7b6b', '#d9cbb8', '#f6f0e6', '#ffffff
 class App {
   engine: Engine;
   input: Input;
-  state = store.load();
+  state = prefs.load();
   tool: Tool = 'brush';
   builder: StrokeBuilder | null = null;
   curve = new PressureCurve();
@@ -97,6 +101,8 @@ class App {
   loupe: HTMLElement;
   canvas: HTMLCanvasElement;
   installEvt: any = null;
+  autosave: Autosave;
+  gallery: Gallery | null = null;
 
   constructor() {
     this.canvas = $('#view') as HTMLCanvasElement;
@@ -121,16 +127,87 @@ class App {
     this.resize();
     window.addEventListener('resize', () => this.resize());
     this.engine.onLayersChanged = () => { if (this.popKind === 'layers') this.renderLayers(); this.scheduleThumbs(); };
-    this.engine.history.onChange = () => this.updateUndoButtons();
-    window.addEventListener('beforeunload', (e) => { if (this.engine.history.canUndo) { e.preventDefault(); e.returnValue = ''; } });
+    this.autosave = new Autosave(this.engine);
+    this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
+    this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); };
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installEvt = e; });
     this.keys();
     const loop = () => { this.engine.render(); requestAnimationFrame(loop); };
     requestAnimationFrame(loop);
     const q = new URLSearchParams(location.search);
     if (q.get('w') && q.get('h')) this.newCanvas(+q.get('w')!, +q.get('h')!);
-    else this.showNewCanvas(true);
+    else void this.boot();
   }
+
+  /** open the last artwork, else the gallery, else the new-canvas sheet */
+  async boot() {
+    try {
+      const last = localStorage.getItem('gesso.last');
+      if (last && (await this.openDoc(last, true))) return;
+      const docs = await store.list();
+      if (docs.length) { this.showGallery(); return; }
+    } catch (err) { console.info('storage unavailable', err); }
+    this.showNewCanvas(true);
+  }
+
+  async openDoc(id: string, quiet = false): Promise<boolean> {
+    if (this.autosave.docId === id) { this.closeGallery(); return true; }
+    const meta = await store.get(id);
+    if (!meta) return false;
+    if (Math.max(meta.w, meta.h) > this.engine.maxTex) { this.toast(`This canvas (${meta.w}×${meta.h}) is too large for this device`); return false; }
+    await this.autosave.flush();
+    const layers = await loadDocPixels(meta);
+    this.autosave.detach();
+    this.engine.loadDocument(meta.w, meta.h, meta.bg, meta.bgVisible, layers, meta.active);
+    this.applyDocExtra(meta.extra || {});
+    this.autosave.attach(meta, true);
+    localStorage.setItem('gesso.last', id);
+    this.thumbVersions.clear();
+    this.fit();
+    this.updateUndoButtons();
+    this.closeGallery();
+    if (!quiet) this.toast(meta.name);
+    return true;
+  }
+
+  /** per-document state beyond layers (filled in by later features) */
+  docExtra(): Record<string, unknown> { return {}; }
+  applyDocExtra(_x: Record<string, unknown>) { /* set by features */ }
+
+  showGallery() {
+    this.closePop();
+    void this.autosave.flush().then(() => {
+      this.closeGallery();
+      this.gallery = new Gallery({
+        open: (id) => void this.openDoc(id),
+        newCanvas: () => this.showNewCanvas(false),
+        importFile: () => this.importGessoFile(),
+        exportFile: (id) => void this.exportGessoFile(id),
+        duplicate: async (id) => { const m = await store.get(id); if (m) await store.duplicate(id, newDocId(), m.name + ' copy'); },
+        remove: async (id) => {
+          await store.remove(id);
+          if (this.autosave.docId === id) { this.autosave.detach(); localStorage.removeItem('gesso.last'); }
+        },
+        rename: async (id, name) => {
+          if (this.autosave.docId === id && this.autosave.meta) { this.autosave.meta.name = name; await this.autosave.flush(); }
+          const m = await store.get(id); if (m) { m.name = name; await store.putMeta(m); }
+          if (this.autosave.meta?.id === id) this.autosave.meta.name = name;
+        },
+        currentId: () => this.autosave.docId,
+        close: () => this.closeGallery(),
+      });
+    });
+  }
+  closeGallery() { this.gallery?.close(); this.gallery = null; }
+
+  async renameCurrent() {
+    const m = this.autosave.meta; if (!m) return;
+    const n = await ask('Rename artwork', { input: m.name, okLabel: 'Rename' });
+    if (n) { m.name = n; this.autosave.touch(); }
+  }
+
+  importGessoFile() { this.toast('Import arrives with the .gesso format'); }
+  async exportGessoFile(_id: string) { this.toast('Export arrives with the .gesso format'); }
 
   fatal(msg: string) {
     document.body.append(h('div', { class: 'fatal' }, h('h2', {}, 'Gesso can\'t start'), h('p', {}, msg), h('p', {}, 'Gesso needs WebGL2. In Brave, check Settings → System → "Use graphics acceleration".')));
@@ -147,7 +224,7 @@ class App {
     this.state.overrides[id] = { ...(this.state.overrides[id] || {}), [key]: val };
     this.save();
   }
-  save() { store.save(this.state); }
+  save() { prefs.save(this.state); }
 
   // ---------------------------------------------------------------- strokes
   strokeStart(s: Sample, _type: string, eraserEnd = false) {
@@ -197,10 +274,23 @@ class App {
   }
 
   // ---------------------------------------------------------------- canvas lifecycle
-  newCanvas(w: number, h: number) {
+  /** start a new artwork (the open one is saved first) */
+  newCanvas(w: number, h: number, name?: string): Promise<void> {
+    if (this.autosave.docId) return this.autosave.flush().then(() => this.newCanvasNow(w, h, name));
+    this.newCanvasNow(w, h, name);
+    return Promise.resolve();
+  }
+  private newCanvasNow(w: number, h: number, name?: string) {
     w = Math.max(16, Math.min(this.engine.maxTex, Math.round(w)));
     h = Math.max(16, Math.min(this.engine.maxTex, Math.round(h)));
+    this.autosave.detach();
     this.engine.newDocument(w, h, [1, 1, 1]);
+    const now = Date.now();
+    const meta: DocMeta = { id: newDocId(), name: name || 'Untitled ' + new Date(now).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }), w, h, bg: [1, 1, 1], bgVisible: true, layers: [], active: 0, created: now, modified: now };
+    this.autosave.attach(meta, false);
+    try { localStorage.setItem('gesso.last', meta.id); } catch { /* private mode */ }
+    void this.autosave.flush();
+    this.closeGallery();
     this.thumbVersions.clear();
     this.fit();
     this.updateUndoButtons();
@@ -230,6 +320,7 @@ class App {
       return b;
     };
     const left = h('div', { class: 'grp' },
+      tb('bGallery', ICON.gallery, 'Gallery', () => this.showGallery()),
       h('button', { id: 'bMenu', class: 'brand', onClick: () => this.togglePop('menu', this.renderMenu) }, h('span', { class: 'logo' }), 'Gesso'),
       tb('bExport', ICON.share, 'Export PNG', () => this.exportPNG()),
     );
@@ -584,7 +675,9 @@ class App {
     const item = (label: string, fn: () => void, sub = '') => h('button', { class: 'mitem', onClick: () => { this.closePop(); fn(); } }, h('span', {}, label), sub ? h('span', { class: 'muted' }, sub) : null);
     const e = this.engine;
     el.append(...[
-      h('div', { class: 'pop-head' }, h('b', {}, 'Canvas'), h('span', { class: 'muted' }, `${e.w} × ${e.h}`)),
+      h('div', { class: 'pop-head' }, h('b', {}, this.autosave.meta?.name || 'Canvas'), h('span', { class: 'muted' }, `${e.w} × ${e.h}`)),
+      item('Gallery', () => this.showGallery(), { saved: 'Saved', pending: 'Saving soon', saving: 'Saving…', error: 'Not saved' }[this.autosave.state]),
+      item('Rename…', () => void this.renameCurrent()),
       item('New canvas…', () => this.showNewCanvas(false)),
       item('Insert a photo', () => this.importPhoto()),
       item('Export PNG', () => this.exportPNG()),
@@ -627,7 +720,6 @@ class App {
     const upd = () => { info.textContent = `Up to ${this.engine.maxLayersFor(+w.value || 1, +hh.value || 1)} layers at this size · max side ${this.engine.maxTex}px`; };
     w.oninput = hh.oninput = upd; upd();
     const go = (W: number, H: number) => {
-      if (!first && this.engine.history.canUndo && !confirm('Start a new canvas? Your current painting will be discarded unless you exported it.')) return;
       s.close(); this.newCanvas(W, H);
     };
     s.body.append(

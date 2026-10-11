@@ -143,3 +143,40 @@ input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
 .pcurve{border-radius:12px;touch-action:none}
 .pcol{flex:1;min-width:260px;display:flex;flex-direction:column;gap:8px}
 .ppad{width:100%;max-width:360px;aspect-ratio:360/150;background:#151312;border-radius:12px;touch-action:none;border:1px dashed rgba(255,255,255,.15)}
+
+/* save state dot on the gallery button */
+#bGallery{position:relative}
+#bGallery::after{content:"";position:absolute;right:7px;top:7px;width:8px;height:8px;border-radius:50%;background:transparent;transition:background .3s}
+#bGallery[data-save=pending]::after,#bGallery[data-save=saving]::after{background:var(--accent)}
+#bGallery[data-save=error]::after{background:#e05545}
+
+/* gallery */
+.gallery{position:fixed;inset:0;z-index:15;background:var(--bg);display:flex;flex-direction:column;animation:fade .15s}
+.g-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:calc(14px + var(--safe-t)) 20px 12px;flex-wrap:wrap}
+.g-title{display:flex;align-items:center;gap:10px;font-size:22px}
+.g-acts{display:flex;gap:8px;flex-wrap:wrap}
+.g-acts .btn{min-height:44px}
+.g-grid{flex:1;overflow:auto;padding:8px 20px 20px;display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:18px;align-content:start}
+.g-card{display:flex;flex-direction:column;gap:8px}
+.g-pic{aspect-ratio:4/3;border-radius:14px;background:#151312;display:grid;grid-template:minmax(0,1fr)/minmax(0,1fr);place-items:center;overflow:hidden;border:2px solid transparent;padding:12px}
+.g-card.cur .g-pic{border-color:var(--accent)}
+.g-pic img{max-width:100%;max-height:100%;min-width:0;min-height:0;border-radius:3px;box-shadow:0 6px 20px rgba(0,0,0,.5)}
+.g-pic img.transparent{background:repeating-conic-gradient(#bbb 0 25%,#ddd 0 50%) 0 0/14px 14px}
+.g-pic:active{transform:scale(.98)}
+.g-row{display:flex;align-items:center;gap:6px}
+.g-meta{flex:1;min-width:0}
+.g-name{font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.g-more{font-size:22px;line-height:1;flex:none}
+.g-menu{position:fixed;z-index:40;width:220px;background:var(--panel2);border:1px solid var(--line);border-radius:14px;padding:6px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+.mitem.danger,.btn.danger{color:#ff8a7a}
+.btn.danger{background:#5a2420;color:#ffd9d2}
+.g-foot{padding:10px 20px calc(10px + env(safe-area-inset-bottom,0px));border-top:1px solid var(--line)}
+.g-empty{grid-column:1/-1;text-align:center;padding:80px 20px}
+.g-empty b{font-size:20px}
+.dialog{width:min(420px,92vw);background:#24211f;border:1px solid var(--line);border-radius:18px;padding:18px;display:flex;flex-direction:column;gap:12px;box-shadow:0 30px 80px rgba(0,0,0,.6)}
+.dialog b{font-size:17px}
+.dialog p{margin:0}
+.dlg-in{background:rgba(255,255,255,.07);border:0;border-radius:10px;padding:12px;font-size:16px}
+.dlg-acts{display:flex;justify-content:flex-end;gap:8px}
+.dlg-acts .btn{min-height:44px}
+.sheet-wrap{z-index:30}

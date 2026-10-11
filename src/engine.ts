@@ -10,8 +10,12 @@ export interface Rect { x: number; y: number; w: number; h: number; }
 export interface Dab { x: number; y: number; r: number; a: number; angle: number; aspect: number; }
 
 let layerSeq = 1;
+const newUid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+export interface LayerProps { uid: string; name: string; visible: boolean; opacity: number; blend: number; alphaLock: boolean; clip: boolean; }
 export class Layer {
   id = layerSeq++;
+  /** stable identity across sessions (storage key) */
+  uid = newUid();
   visible = true;
   opacity = 1;
   blend = 0;
@@ -19,6 +23,7 @@ export class Layer {
   clip = false;
   version = 0;
   constructor(public name: string, public target: Target) {}
+  props(): LayerProps { return { uid: this.uid, name: this.name, visible: this.visible, opacity: this.opacity, blend: this.blend, alphaLock: this.alphaLock, clip: this.clip }; }
 }
 
 export type Tool = 'brush' | 'eraser' | 'smudge';
@@ -343,6 +348,7 @@ export class Engine {
 
   render() {
     const gl = this.gl;
+    if (!this.comp) return; // no document yet (boot is still reading storage)
     if (!this.cur) this.maintainStashes();
     if (this.dirty) {
       this.composite(this.dirty);
@@ -817,6 +823,63 @@ export class Engine {
     const l = new Layer(name, t);
     this.insertLayer(l, this.active + 1, 'Import image');
     return l;
+  }
+
+  // ---------------------------------------------------------------- persistence
+  /** full layer pixels (premultiplied RGBA, GL row order) without stalling the pipeline */
+  readLayerAsync(layer: Layer): Promise<Uint8Array> {
+    return new Readback(this.gl, layer.target.fb, 0, 0, this.w, this.h).wait();
+  }
+
+  /** replace the whole document (no undo history) */
+  loadDocument(w: number, h: number, bg: [number, number, number], bgVisible: boolean, layers: { props: LayerProps; data: Uint8Array | null }[], active: number) {
+    this.newDocument(w, h, bg);
+    const gl = this.gl;
+    freeTarget(gl, this.layers[0].target);
+    this.layers = layers.map(({ props, data }) => {
+      const t = makeTarget(gl, w, h);
+      if (data && data.byteLength === w * h * 4) {
+        gl.bindTexture(gl.TEXTURE_2D, t.tex);
+        gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+        gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, data);
+      }
+      const l = new Layer(props.name, t);
+      Object.assign(l, { uid: props.uid || l.uid, visible: props.visible, opacity: props.opacity, blend: props.blend, alphaLock: props.alphaLock, clip: props.clip });
+      return l;
+    });
+    if (!this.layers.length) this.layers = [new Layer('Layer 1', makeTarget(gl, w, h))];
+    this.bgVisible = bgVisible;
+    this.active = Math.max(0, Math.min(this.layers.length - 1, active));
+    this.markDirty();
+    this.onLayersChanged();
+  }
+
+  /** composite preview scaled to fit maxSide, as a 2D canvas (straight alpha) */
+  compositeThumbnail(maxSide = 320, withBg = this.bgVisible): HTMLCanvasElement {
+    const gl = this.gl;
+    const k = Math.min(1, maxSide / Math.max(this.w, this.h));
+    const tw = Math.max(1, Math.round(this.w * k)), th = Math.max(1, Math.round(this.h * k));
+    this.composite({ x: 0, y: 0, w: this.w, h: this.h }, withBg);
+    const t = makeTarget(gl, tw, th);
+    bindTarget(gl, t);
+    gl.disable(gl.BLEND);
+    // generate mips on the composite for a clean minified sample, then 4x4 supersample on top
+    gl.bindTexture(gl.TEXTURE_2D, this.comp.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    this.pDown.use().tex('uSrc', 0, this.comp.tex).f('uStep', 1 / tw, 1 / th);
+    this.drawQuad();
+    const px = this.readRect(t, { x: 0, y: 0, w: tw, h: th });
+    freeTarget(gl, t);
+    this.markDirty();
+    const out = document.createElement('canvas'); out.width = tw; out.height = th;
+    const img = new ImageData(tw, th);
+    for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
+      const i = (y * tw + x) * 4, o = i, a = px[i + 3], f = a ? 255 / a : 0;
+      img.data[o] = px[i] * f; img.data[o + 1] = px[i + 1] * f; img.data[o + 2] = px[i + 2] * f; img.data[o + 3] = a;
+    }
+    out.getContext('2d')!.putImageData(img, 0, 0);
+    return out;
   }
 
   /** debugging/testing helper: average alpha of a layer region */

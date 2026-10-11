@@ -14,7 +14,7 @@ async function start({ port = 8125, width = 1280, height = 800, dsf = 2, touch =
   const page = await ctx.newPage();
   const errs = [];
   page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errs.push(m.type() + ': ' + m.text()); });
-  page.on('pageerror', (e) => errs.push('pageerror: ' + e.message));
+  page.on('pageerror', (e) => errs.push('pageerror: ' + e.message + ' @ ' + (e.stack || '').split('\n').slice(1, 4).join(' | ')));
   const shot = (n) => page.screenshot({ path: path.join(__dirname, '..', 'shots', n + '.png') });
   const close = async () => { await browser.close(); srv.close(); };
   return { browser, ctx, page, errs, shot, close, url: `http://localhost:${port}/` };
