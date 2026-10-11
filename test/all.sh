@@ -9,8 +9,8 @@ case "$1" in
   3) set -- bigdoc timelapse ;;
   4) set -- warp anim ;;
   5) set -- tiles ;;
-  6) set -- groups adjust ;;
-  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust ;;
+  6) set -- groups adjust wet ;;
+  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust wet ;;
 esac
 fail=0
 [ "$1" = run ] && { node test/quickshape-unit.cjs | tail -1 || fail=1; }

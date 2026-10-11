@@ -405,3 +405,47 @@ void main(){
   else if (uR < 0.0) r = min(m, clamp(dist(uOut, p) + uR, 0.0, 1.0));
   o = vec4(r, r, r, 1.0);
 }`;
+
+// ---------------------------------------------------------------- wet media (watercolour drying)
+// Field texel: r = pigment suspended in water, g = water, b = pigment deposited on the paper, a = initial wetness.
+export const WET_INIT_FS = `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o;
+uniform sampler2D uStroke; uniform float uWet;
+void main(){ float c = texture(uStroke, vUv).r; float w = uWet * smoothstep(0.08, 0.7, c); o = vec4(c, w, 0.0, w); }`;
+// One drying step. Water spreads to neighbours (slowly into dry paper, guided by the paper grain) and evaporates,
+// fastest at the wet edge. Suspended pigment rides the water downhill: as the rim dries first, water flows
+// outward and carries pigment to it (the dark "coffee ring" edge). Pigment deposits as the water leaves,
+// more in the grain's valleys (granulation).
+export const WET_STEP_FS = `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o;
+uniform sampler2D uF, uGrain; uniform vec2 uTexel; uniform float uOff, uEvap, uFlow, uGran, uGrainScale, uLast; uniform vec2 uDocSize;
+void main(){
+  vec4 f = texture(uF, vUv);
+  vec2 d = uTexel * uOff;
+  vec4 n0 = texture(uF, vUv + vec2(d.x, 0.0)), n1 = texture(uF, vUv - vec2(d.x, 0.0)), n2 = texture(uF, vUv + vec2(0.0, d.y)), n3 = texture(uF, vUv - vec2(0.0, d.y));
+  float g = texture(uGrain, vUv * uDocSize / (256.0 * uGrainScale)).r;   // paper height 0..1
+  float p = f.r, w = f.g, dep = f.b;
+  // water: diffusion inside the wet area; dry paper only wicks a little along the fibres (soft, feathery bleed)
+  float wn = (n0.g + n1.g + n2.g + n3.g) * 0.25;
+  float spread = w > 0.03 ? 0.45 : 0.06 * g * g;
+  float edge = step(0.03, w) * (1.0 - smoothstep(0.0, 0.2, min(min(n0.g, n1.g), min(n2.g, n3.g))));
+  float w2 = max(0.0, w + spread * (wn - w) - uEvap * (1.0 + 3.0 * edge));
+  // pigment flux along the water gradient between wet cells only (from wetter to drier), conserving pigment:
+  // the rim evaporates first, water flows outward to replace it and carries pigment to the edge
+  float wet0 = step(0.03, n0.g), wet1 = step(0.03, n1.g), wet2 = step(0.03, n2.g), wet3 = step(0.03, n3.g), wetc = step(0.03, w);
+  float inflow = wetc * (n0.r * max(0.0, n0.g - w) + n1.r * max(0.0, n1.g - w) + n2.r * max(0.0, n2.g - w) + n3.r * max(0.0, n3.g - w));
+  float outflow = p * (wet0 * max(0.0, w - n0.g) + wet1 * max(0.0, w - n1.g) + wet2 * max(0.0, w - n2.g) + wet3 * max(0.0, w - n3.g));
+  float p2 = max(0.0, p + uFlow * (inflow - outflow));
+  // gentle diffusion of suspended pigment inside the wet area
+  float pn = (n0.r + n1.r + n2.r + n3.r) * 0.25;
+  p2 += 0.45 * min(w, wn) * (pn - p);
+  // deposition as the water leaves; granulation settles more pigment in the valleys of the paper
+  float dry = clamp((w - w2) / max(w, 1e-3), 0.0, 1.0);
+  float settle = p2 * clamp(dry * mix(1.0, 1.7 * (1.0 - g) + 0.15, uGran) + 0.01, 0.0, 1.0);
+  if (uLast > 0.5 || w2 <= 0.001) settle = p2;
+  o = vec4(p2 - settle, w2, dep + settle, f.a);
+}`;
+export const WET_OUT_FS = `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o;
+uniform sampler2D uF;
+void main(){ vec4 f = texture(uF, vUv); o = vec4(clamp(f.r + f.b, 0.0, 1.0), 0.0, 0.0, 1.0); }`;

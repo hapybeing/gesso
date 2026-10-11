@@ -32,6 +32,10 @@ export interface Brush {
   wetEdges: number;    // 0..1
   smoothing: number;   // 0..1 streamline
   smudge: number;      // smudge strength 0..1
+  /** wet media: after the stroke, pigment and water diffuse and dry on the paper (0 = off) */
+  wet?: number;
+  /** granulation of the drying pigment into the paper grain 0..1 */
+  granulation?: number;
 }
 
 const base: Omit<Brush, 'id' | 'name' | 'group'> = {
@@ -53,9 +57,9 @@ export const BRUSHES: Brush[] = [
   B('air-soft', 'Soft Air', 'Airbrush', { shape: 'soft', size: 160, minSize: 0.6, flow: 0.06, spacing: 0.06, pressSize: 0.4, pressOpacity: 1, smoothing: 0.4 }),
   B('air-hard', 'Hard Air', 'Airbrush', { shape: 'soft', size: 60, minSize: 0.7, flow: 0.18, spacing: 0.05, pressSize: 0.2, pressOpacity: 1, smoothing: 0.3 }),
   B('air-spatter', 'Speckle Can', 'Airbrush', { shape: 'spatter', size: 120, minSize: 0.6, flow: 0.5, spacing: 0.35, rotJitter: 1, sizeJitter: 0.4, scatter: 0.3, pressOpacity: 0.7, smoothing: 0 }),
-  B('wc-wash', 'Wet Wash', 'Watercolour', { shape: 'wash', grain: 'paper', size: 90, minSize: 0.5, opacity: 0.75, flow: 0.25, spacing: 0.07, pressSize: 0.6, pressOpacity: 0.6, grainScale: 3, grainDepth: 0.12, wetEdges: 0.9, rotJitter: 1, smoothing: 0.35 }),
-  B('wc-round', 'Round Sable', 'Watercolour', { shape: 'soft', grain: 'cold', size: 36, minSize: 0.2, opacity: 0.8, flow: 0.35, spacing: 0.05, grainScale: 2.5, grainDepth: 0.15, wetEdges: 0.7, taperStart: 20, taperEnd: 40, smoothing: 0.35 }),
-  B('wc-bleed', 'Bleed Bloom', 'Watercolour', { shape: 'wash', grain: 'paper', size: 140, minSize: 0.7, opacity: 0.55, flow: 0.14, spacing: 0.08, scatter: 0.06, sizeJitter: 0.2, rotJitter: 1, grainScale: 3, grainDepth: 0.15, wetEdges: 1, smoothing: 0.3 }),
+  B('wc-wash', 'Wet Wash', 'Watercolour', { shape: 'wash', grain: 'paper', size: 90, minSize: 0.5, opacity: 0.75, flow: 0.25, spacing: 0.07, pressSize: 0.6, pressOpacity: 0.6, grainScale: 3, grainDepth: 0.12, wetEdges: 0.9, rotJitter: 1, smoothing: 0.35, wet: 0.8, granulation: 0.5 }),
+  B('wc-round', 'Round Sable', 'Watercolour', { shape: 'soft', grain: 'cold', size: 36, minSize: 0.2, opacity: 0.8, flow: 0.35, spacing: 0.05, grainScale: 2.5, grainDepth: 0.15, wetEdges: 0.7, taperStart: 20, taperEnd: 40, smoothing: 0.35, wet: 0.45, granulation: 0.35 }),
+  B('wc-bleed', 'Bleed Bloom', 'Watercolour', { shape: 'wash', grain: 'paper', size: 140, minSize: 0.7, opacity: 0.55, flow: 0.14, spacing: 0.08, scatter: 0.06, sizeJitter: 0.2, rotJitter: 1, grainScale: 3, grainDepth: 0.15, wetEdges: 1, smoothing: 0.3, wet: 1, granulation: 0.6 }),
   B('marker-chisel', 'Chisel Marker', 'Markers', { shape: 'chisel', size: 28, minSize: 0.85, opacity: 0.7, flow: 1, spacing: 0.03, roundness: 0.3, angle: 45, pressSize: 0.15, smoothing: 0.3 }),
   B('marker-felt', 'Felt Tip', 'Markers', { shape: 'hard', grain: 'noise', size: 12, minSize: 0.8, opacity: 0.85, flow: 0.9, spacing: 0.05, pressSize: 0.2, grainDepth: 0.25, smoothing: 0.25 }),
   B('paint-bristle', 'Oil Bristle', 'Painting', { shape: 'bristle', grain: 'canvas', size: 50, minSize: 0.4, flow: 0.85, spacing: 0.04, followDir: true, pressSize: 0.6, pressOpacity: 0.4, grainDepth: 0.35, grainScale: 1.0, taperEnd: 40, smoothing: 0.2 }),

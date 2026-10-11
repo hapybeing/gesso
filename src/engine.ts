@@ -176,6 +176,7 @@ export class Engine {
     this.maxTex = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 8192);
     this.initGL();
     this.pool = new TilePool(gl, () => this.drawQuad(), () => ({ w: this.w, h: this.h }));
+    this.history.before = () => this.settleWet();
     Layer.pool = this.pool;
   }
 
@@ -259,6 +260,8 @@ export class Engine {
 
   newDocument(w: number, h: number, bg: [number, number, number] = [1, 1, 1]) {
     const gl = this.gl;
+    this.drying = null; this.cur = null;
+    if (this.wetF) { for (const t of this.wetF) freeTarget(gl, t); this.wetF = null; }
     this.history.clear();
     for (const l of this.layers) this.pool.releaseLayer(l);
     this.pool.dispose();
@@ -314,7 +317,7 @@ export class Engine {
     if (live) {
       const b = c!.brush;
       p.f('uColor', ...c!.color).f('uStrokeOpacity', b.opacity)
-        .f('uWet', c!.tool === 'eraser' ? 0 : b.wetEdges).f('uWetR', Math.max(2, b.size * 0.15))
+        .f('uWet', c!.tool === 'eraser' ? 0 : b.wet ? b.wetEdges * 0.3 : b.wetEdges).f('uWetR', Math.max(2, b.size * 0.15))
         .i('uAlphaLock', layer!.alphaLock ? 1 : 0);
     } else p.f('uWet', 0).i('uAlphaLock', 0).f('uStrokeOpacity', 0).f('uColor', 0, 0, 0).f('uWetR', 1);
     p.f('uTexel', 1 / this.w, 1 / this.h);
@@ -525,6 +528,7 @@ export class Engine {
   render() {
     const gl = this.gl;
     if (!this.comp) return; // no document yet (boot is still reading storage)
+    if (this.drying) this.advanceDrying(2);
     if (!this.cur) { this.maintainStashes(); this.maintainTiles(); }
     if (this.dirty) {
       this.composite(this.dirty);
@@ -564,6 +568,7 @@ export class Engine {
 
   // ---------------------------------------------------------------- strokes
   beginStroke(tool: Tool, brush: Brush, color: [number, number, number]) {
+    this.settleWet();
     if (this.cur) this.cancelStroke();
     const layer = this.activeLayer;
     if (!layer || layer.group) return false;
@@ -582,7 +587,64 @@ export class Engine {
     return true;
   }
 
-  get stroking() { return !!this.cur; }
+  /** a stroke is being drawn (not counting a watercolour stroke that is still drying on its own) */
+  get stroking() { return !!this.cur && !this.drying; }
+
+  // ---------------------------------------------------------------- wet media: drying simulation after a wet stroke
+  private drying: { left: number; total: number; rect: Rect; dried?: boolean } | null = null;
+  private wetF: Target[] | null = null;
+  private pWet: Record<string, Program> | null = null;
+  /** setting: run the drying simulation for wet brushes */
+  wetMedia = true;
+  get isDrying() { return !!this.drying; }
+  private startDrying(c: StrokeState) {
+    const gl = this.gl, b = c.brush, wet = Math.min(1, b.wet ?? 0);
+    const off = Math.max(1, b.size / 48);
+    const total = Math.round(26 + 26 * wet);
+    const bleed = Math.ceil(off * Math.sqrt(total) * 1.2 + 4);
+    const base = this.padRectFor(c, c.bbox!);
+    const rect = this.clampRect({ x: base.x - bleed, y: base.y - bleed, w: base.w + bleed * 2, h: base.h + bleed * 2 });
+    if (!rect) return false;
+    if (!this.pWet) this.pWet = { init: this.program(S.WET_INIT_FS), step: this.program(S.WET_STEP_FS), out: this.program(S.WET_OUT_FS) };
+    if (!this.wetF) {
+      const fl = this.strokeFloat ? { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT } : {};
+      this.wetF = [makeTarget(gl, this.w, this.h, fl), makeTarget(gl, this.w, this.h, fl)];
+    }
+    c.bbox = { ...rect };
+    gl.disable(gl.BLEND); gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x, rect.y, rect.w, rect.h);
+    bindTarget(gl, this.wetF[0]);
+    this.pWet.init.use().tex('uStroke', 0, this.stroke.tex).f('uWet', 0.35 + 0.65 * wet);
+    this.drawQuad();
+    gl.disable(gl.SCISSOR_TEST);
+    this.drying = { left: total, total, rect };
+    this.markDirty(rect);
+    return true;
+  }
+  /** advance the drying by n steps; bakes the stroke when the paint is dry */
+  private advanceDrying(n: number) {
+    const d = this.drying, c = this.cur;
+    if (!d || !c || !this.wetF || !this.pWet) { this.drying = null; return; }
+    const gl = this.gl, b = c.brush, r = d.rect;
+    gl.disable(gl.BLEND); gl.enable(gl.SCISSOR_TEST); gl.scissor(r.x, r.y, r.w, r.h);
+    const off = Math.max(1, b.size / 48);
+    const p = this.pWet.step;
+    for (let i = 0; i < n && d.left > 0; i++, d.left--) {
+      bindTarget(gl, this.wetF[1]);
+      p.use().tex('uF', 0, this.wetF[0].tex).tex('uGrain', 1, this.grainTex(b.grain === 'none' ? 'paper' : b.grain))
+        .f('uTexel', 1 / this.w, 1 / this.h).f('uOff', off).f('uEvap', 0.9 / d.total).f('uFlow', 0.85).f('uGran', b.granulation ?? 0.4)
+        .f('uGrainScale', b.grainScale || 1).f('uLast', d.left === 1 ? 1 : 0).f('uDocSize', this.w, this.h);
+      this.drawQuad();
+      const t = this.wetF[0]; this.wetF[0] = this.wetF[1]; this.wetF[1] = t;
+    }
+    bindTarget(gl, this.stroke);
+    this.pWet.out.use().tex('uF', 0, this.wetF[0].tex);
+    this.drawQuad();
+    gl.disable(gl.SCISSOR_TEST);
+    this.markDirty(r);
+    if (d.left <= 0) { d.dried = true; this.endStroke(); }
+  }
+  /** finish any drying stroke now (before undo, a new stroke, export…) */
+  settleWet() { if (this.drying) this.advanceDrying(this.drying.left); }
 
   private dabRect(d: Dab, pad = 2): Rect {
     const r = d.r * 1.42 + pad;
@@ -692,6 +754,7 @@ export class Engine {
   }
 
   cancelStroke() {
+    if (this.drying) { this.settleWet(); return; }
     const c = this.cur;
     if (!c) return;
     if (c.tool === 'smudge' && this.snapshot) {
@@ -740,6 +803,8 @@ export class Engine {
     const c = this.cur;
     if (!c) return;
     if (!c.bbox) { this.cur = null; return; }
+    if (!this.drying && this.wetMedia && c.tool === 'brush' && (c.brush.wet ?? 0) > 0 && this.startDrying(c)) return;
+    this.drying = null;
     const gl = this.gl;
     const rect = this.clampRect(this.padRectFor(c, c.bbox));
     if (!rect) { this.cancelStroke(); return; }

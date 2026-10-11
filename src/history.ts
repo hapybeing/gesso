@@ -52,7 +52,10 @@ export class History {
   }
   get canUndo() { return this.idx > 0; }
   get canRedo() { return this.idx < this.list.length; }
+  /** called before an undo/redo (lets a drying stroke finish first) */
+  before: () => void = () => {};
   undo(): string | null {
+    this.before();
     if (!this.canUndo) return null;
     const e = this.list[--this.idx];
     this.lastTouched = e;
@@ -60,6 +63,7 @@ export class History {
     return e.label;
   }
   redo(): string | null {
+    this.before();
     if (!this.canRedo) return null;
     const e = this.list[this.idx++];
     this.lastTouched = e;
