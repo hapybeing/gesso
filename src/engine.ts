@@ -700,6 +700,22 @@ export class Engine {
     out.getContext('2d')!.putImageData(img, 0, 0);
   }
 
+  /** like thumbnail(), but read back asynchronously (no pipeline stall); resolves when drawn */
+  async thumbnailAsync(layer: Layer, out: HTMLCanvasElement) {
+    const gl = this.gl, tw = out.width, th = out.height;
+    const t = makeTarget(gl, tw, th);
+    const scale = Math.max(this.w / tw, this.h / th);
+    bindTarget(gl, t); gl.disable(gl.BLEND);
+    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
+    this.drawQuad();
+    const rb = new Readback(gl, t.fb, 0, 0, tw, th);
+    freeTarget(gl, t); // the copy into the pack buffer is already queued
+    const px = await rb.wait();
+    const img = new ImageData(tw, th);
+    for (let i = 0; i < px.length; i += 4) { const a = px[i + 3], k = a ? 255 / a : 0; img.data[i] = px[i] * k; img.data[i + 1] = px[i + 1] * k; img.data[i + 2] = px[i + 2] * k; img.data[i + 3] = a; }
+    out.getContext('2d')!.putImageData(img, 0, 0);
+  }
+
   // ---------------------------------------------------------------- layer ops (all undoable)
   private newTarget() { return makeTarget(this.gl, this.w, this.h); }
   private copyTarget(src: Target): Target {

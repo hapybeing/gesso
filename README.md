@@ -26,6 +26,7 @@ Static files in dist/ (all paths relative). Hosted on GitHub Pages at hapybeing.
 - src/transformtool.ts  transform box (image import, selection/layer transform): uniform, free, distort (homography), warp (Bézier patch)
 - src/selecttool.ts  selection tools (rect, ellipse, freehand/polygon, automatic flood fill)
 - src/timelapse.ts   time-lapse recorder (per-step capture → WebCodecs), replay screen, export; src/video.ts codec choice/encode/decode/transcode; src/mux.ts own MP4 + WebM muxers
+- src/animation.ts   animation assist: frames, timeline, onion skin, light table, playback; src/animexport.ts GIF / MP4 / WebM / PNG-sequence export; src/gif.ts own GIF encoder (palette, dither, LZW), run in worker.ts
 - src/dom.ts         shared DOM helpers
 - public/         index.html, style.css, manifest, service worker, icons
 

@@ -37,8 +37,13 @@ const helpers = () => {
   // holds and play modes
   out.ticks = await page.evaluate(() => { const a = window.gesso.anim; const f = a.frames(); a.setHold(f[2].base, 2);
     const loop = a.ticks().join(''); a.set('mode', 'pingpong'); const pp = a.ticks().join(''); a.set('mode', 'loop'); return { loop, pp, runs: JSON.stringify(a.runs()) }; });
+  // wrap-around onion for cycles: on frame 1, the last frame shows as a 'before' skin
+  out.wrap = await page.evaluate(async () => { const a = window.gesso.anim; a.goto(0); await __raf(); const off = __c(600, 300); a.set('onionWrap', true); await __raf(); const on = __c(600, 300); const prev2 = __c(500, 300); a.set('onionWrap', false); return { off, on, prev2 }; });
   // light table pin + background layer
-  out.light = await page.evaluate(async () => { const a = window.gesso.anim; const f = a.frames(); a.togglePin(f[0].base); a.goto(5); await __raf(); const pinned = __c(100, 300); a.togglePin(f[0].base); await __raf(); return { pinned, unpinned: __c(100, 300) }; });
+  out.light = await page.evaluate(async () => { const a = window.gesso.anim; const f = a.frames(); a.togglePin(f[0].base); a.goto(5); await __raf(); const pinned = __c(100, 300); a.togglePin(f[0].base); await __raf();
+    // a layer shown under every frame
+    a.setRole(f[0].base, 'bg'); await __raf(); const bgFrames = a.frames().length; const bgShown = __c(100, 300); a.setRole(f[0].base, null); await __raf();
+    return { pinned, unpinned: __c(100, 300), bgFrames, bgShown, back: a.frames().length }; });
   // playback: 12 fps for ~1.5 s
   out.play = await page.evaluate(async () => { const a = window.gesso.anim; a.goto(0); a.play(); const t0 = performance.now(); await __sleep(1500); const st = { ...a.stats }; const playing = a.playing; await T_shot_marker(); a.stop(); return { ...st, playing, ms: Math.round(performance.now() - t0) }; function T_shot_marker() { return Promise.resolve(); } });
   // move frame 1 to the right, then back (one undo step each)

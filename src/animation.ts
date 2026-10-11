@@ -13,6 +13,8 @@ export interface AnimState {
   onionBefore: number; onionAfter: number; onionOpacity: number;
   tint: 'off' | 'redgreen' | 'blueorange';
   blendPrimary: boolean;
+  /** onion skins wrap around the ends (for cycles) */
+  onionWrap: boolean;
   lightOpacity: number;
   /** extra display frames per frame (uid → n) */
   holds: Record<string, number>;
@@ -21,7 +23,7 @@ export interface AnimState {
   /** light-table pins: frames always shown faintly */
   pins: string[];
 }
-export const defaultAnim = (): AnimState => ({ on: false, fps: 12, mode: 'loop', onionBefore: 2, onionAfter: 1, onionOpacity: 0.45, tint: 'redgreen', blendPrimary: false, lightOpacity: 0.3, holds: {}, roles: {}, pins: [] });
+export const defaultAnim = (): AnimState => ({ on: false, fps: 12, mode: 'loop', onionBefore: 2, onionAfter: 1, onionOpacity: 0.45, tint: 'redgreen', blendPrimary: false, onionWrap: false, lightOpacity: 0.3, holds: {}, roles: {}, pins: [] });
 const TINTS: Record<AnimState['tint'], [[number, number, number], [number, number, number]] | null> = {
   off: null,
   redgreen: [[0.86, 0.22, 0.2], [0.16, 0.6, 0.3]],
@@ -126,22 +128,29 @@ export class Animator {
     if (onion && i >= 0) {
       const tints = TINTS[this.st.tint];
       const amt = tints ? 0.8 : 0;
-      // light table pins (outside the onion range) underneath everything else
+      // nearest frames claim their slot first (matters when wrapping round a short cycle), then draw far → near
+      const N = fr.length, nb = this.st.onionBefore, na = this.st.onionAfter;
+      const shown = new Set<number>([i]);
+      const picks: { j: number; k: number; n: number; tint: [number, number, number] | null }[] = [];
+      for (let k = 1; k <= Math.max(nb, na); k++) {
+        for (const [dir, n, tint] of [[-1, nb, tints ? tints[0] : null], [1, na, tints ? tints[1] : null]] as [number, number, [number, number, number] | null][]) {
+          if (k > n) continue;
+          let j = i + dir * k;
+          if (this.st.onionWrap && N > 2) j = ((j % N) + N) % N;
+          if (j < 0 || j >= N || shown.has(j)) continue;
+          shown.add(j); picks.push({ j, k, n, tint });
+        }
+      }
+      // light-table pins that are not already onion skins go underneath everything else
       for (const uid of this.st.pins) {
         const k = fr.findIndex((f) => f.base.uid === uid);
-        if (k < 0 || k === i || Math.abs(k - i) <= (k < i ? this.st.onionBefore : this.st.onionAfter)) continue;
-        unit(fr[k], this.st.lightOpacity, [...PIN_TINT, 0.7]);
+        if (k >= 0 && !shown.has(k)) unit(fr[k], this.st.lightOpacity, [...PIN_TINT, 0.7]);
       }
-      const side = (n: number, dir: -1 | 1, tint: [number, number, number] | null) => {
-        for (let k = n; k >= 1; k--) {
-          const j = i + dir * k;
-          if (j < 0 || j >= fr.length) continue;
-          const fall = n > 1 ? 1 - (0.6 * (k - 1)) / (n - 1) : 1;
-          unit(fr[j], this.st.onionOpacity * fall, tint ? [...tint, amt] : undefined);
-        }
-      };
-      side(this.st.onionBefore, -1, tints ? tints[0] : null);
-      side(this.st.onionAfter, 1, tints ? tints[1] : null);
+      picks.sort((x, y) => y.k - x.k);
+      for (const p of picks) {
+        const fall = p.n > 1 ? 1 - (0.6 * (p.k - 1)) / (p.n - 1) : 1;
+        unit(fr[p.j], this.st.onionOpacity * fall, p.tint ? [...p.tint, amt] : undefined);
+      }
     }
     if (i >= 0 && fr[i]) unit(fr[i], onion && this.st.blendPrimary ? 0.65 : 1, undefined, true);
     roleItems('fg');
@@ -330,7 +339,7 @@ export class Animator {
     clearTimeout(this.thumbTimer);
     this.thumbTimer = window.setTimeout(() => {
       if (this.e.stroking) { this.updateThumbs(); return; }
-      for (const f of this.frames()) { const t = this.thumbs.get(f.base.uid); if (t && t.v !== f.base.version) { this.e.thumbnail(f.base, t.c); t.v = f.base.version; } }
+      for (const f of this.frames()) { const t = this.thumbs.get(f.base.uid); if (t && t.v !== f.base.version) { t.v = f.base.version; void this.e.thumbnailAsync(f.base, t.c); } }
     }, 120);
   }
 
@@ -394,7 +403,8 @@ export class Animator {
         range('Frames after', 0, 12, 1, s.onionAfter, (v) => String(v), (v) => this.set('onionAfter', v)),
         range('Opacity', 0, 100, 1, Math.round(s.onionOpacity * 100), (v) => v + '%', (v) => this.set('onionOpacity', v / 100)),
         seg<AnimState['tint']>([['redgreen', 'Red / green'], ['blueorange', 'Blue / orange'], ['off', 'True colour']], s.tint, (v) => this.set('tint', v)),
-        h('div', { class: 'chips' }, h('button', { class: 'chip' + (s.blendPrimary ? ' on' : ''), onClick: () => { this.set('blendPrimary', !s.blendPrimary); draw(); } }, 'Blend current frame')),
+        h('div', { class: 'chips' }, h('button', { class: 'chip' + (s.blendPrimary ? ' on' : ''), onClick: () => { this.set('blendPrimary', !s.blendPrimary); draw(); } }, 'Blend current frame'),
+          h('button', { class: 'chip' + (s.onionWrap ? ' on' : ''), title: 'Show the last frames before frame 1 (and the first after the last) — for loops and cycles', onClick: () => { this.set('onionWrap', !s.onionWrap); draw(); } }, 'Wrap around (cycles)')),
         h('h4', {}, 'Light table'),
         range('Pinned frames', 5, 80, 1, Math.round(s.lightOpacity * 100), (v) => v + '%', (v) => this.set('lightOpacity', v / 100)),
         h('p', { class: 'muted' }, s.pins.length ? `${s.pins.length} pinned — tap a frame twice → Unpin.` : 'Pin key poses (tap a frame twice → Pin) to keep them visible while you draw in-betweens anywhere in the timeline.'),

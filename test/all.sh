@@ -16,6 +16,7 @@ for t in "$@"; do
   [ -f test/$t.cjs ] || { echo "$t: missing"; continue; }
   out=$(timeout 115 node test/$t.cjs 2>&1); code=$?
   last=$(echo "$out" | grep -E "^errors:" | tail -1)
+  [ $code -eq 124 ] && pkill -f 'chrome.*swiftshader' 2>/dev/null   # a timed-out test leaves its browser behind
   echo "$t: exit $code, $last"
   [ $code -ne 0 ] && fail=1
   echo "$last" | grep -q "errors: none" || fail=1

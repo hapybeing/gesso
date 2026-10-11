@@ -30,10 +30,12 @@ Known debt: full-canvas textures rather than tiles.
 - [x] Review R2-lite (part A)
 - [x] Review R2 (full; on-device feel checks still pending)
 
-## M3 — Animation
-- [ ] Animation assist: frames = layers/groups, timeline strip, onion skin (count, opacity, colours), FPS, loop/ping-pong/one-shot, hold frames
-- [ ] Playback at FPS, export GIF (own encoder in a worker), MP4/WebM, PNG sequence
-- [ ] Review R3
+## M3 — Animation [built + reviewed R3 2026-10-12]
+- [x] Animation assist: frames = layers (clips attached), timeline strip, onion skin (before/after counts, opacity falloff, tints, blend current, wrap for cycles), FPS 1–60, loop/ping-pong/one-shot, hold frames (drag on the timeline)
+- [x] Playback at FPS (wall-clock), export GIF (own encoder in a worker), MP4/WebM (free repeats), PNG sequence zip
+- [x] Extras: light-table pins, show-on-every-frame under/over for any layer, duplicate/insert/move frame, keyboard stepping
+- [x] Review R3
+- [ ] Next: off-GPU storage for long animations, undoable holds, audio track
 
 ## Later
 True tiled canvases (16k), layer groups, adjustments (HSB, curves, Gaussian blur, liquify), text, reference window, pressure curve per pen.
