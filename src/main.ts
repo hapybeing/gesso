@@ -8,6 +8,8 @@ import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
 import { readGesso, writeGesso, encodePNG, unpremultiply } from './gessofile';
 import { ShapeTool } from './shapetool';
+import { TransformTool } from './transformtool';
+import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
 import type { Shape } from './quickshape';
 import { dabsAlong } from './stroke';
@@ -117,6 +119,7 @@ class App {
   capture: { kind: 'shape'; i: number } | { kind: 'symC' | 'symR' } | null = null;
   sym: Symmetry = defaultSymmetry(1, 1);
   symBar: HTMLElement | null = null;
+  xform: TransformTool | null = null;
   strokeBrush: Brush | null = null;
 
   constructor() {
@@ -158,6 +161,11 @@ class App {
     this.autosave = new Autosave(this.engine);
     this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
     this.autosave.extra = () => this.docExtra();
+    this.autosave.blocked = () => !!this.xform || this.shapes.active;
+    window.addEventListener('paste', (ev) => {
+      const f = [...(ev.clipboardData?.files || [])].find((x) => x.type.startsWith('image/'));
+      if (f) { ev.preventDefault(); void this.placeImage(f, 'Pasted image'); }
+    });
     this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); };
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installEvt = e; });
     this.keys();
@@ -325,7 +333,7 @@ class App {
 
   // ---------------------------------------------------------------- strokes
   /** finish any pending on-canvas edit (shape handles) before another action */
-  settle() { this.shapes.commit(); }
+  settle() { this.shapes.commit(); this.xform?.finish(true); }
 
   captureAt(sx: number, sy: number) {
     if (this.symBar && this.sym.mode !== 'off') {
@@ -445,6 +453,7 @@ class App {
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     drawGuide(g, this.engine, this.sym, !!this.symBar);
     this.shapes.drawOverlay(g);
+    this.xform?.drawOverlay(g);
   }
 
   undo() {
@@ -876,7 +885,7 @@ class App {
       item('Gallery', () => this.showGallery(), { saved: 'Saved', pending: 'Saving soon', saving: 'Saving…', error: 'Not saved' }[this.autosave.state]),
       item('Rename…', () => void this.renameCurrent()),
       item('New canvas…', () => this.showNewCanvas(false)),
-      item('Insert a photo', () => this.importPhoto()),
+      item('Insert a photo', () => this.importPhoto(), 'move · scale · rotate'),
       item('Export PNG', () => this.exportPNG()),
       item('Export PNG (transparent)', () => this.exportPNG(false)),
       item('Export .gesso file', () => void this.exportGessoFile(), 'layers kept · opens in Krita as .ora'),
@@ -990,16 +999,43 @@ class App {
 
   importPhoto() {
     const inp = h('input', { type: 'file', accept: 'image/*' }) as HTMLInputElement;
-    inp.onchange = async () => {
-      const f = inp.files?.[0]; if (!f) return;
-      try {
-        const bmp = await createImageBitmap(f);
-        if (!this.engine.importImage(bmp, f.name.replace(/\.[^.]+$/, '').slice(0, 24) || 'Photo')) this.toast('Layer limit reached');
-        bmp.close();
-      } catch { this.toast('Could not read that image'); }
-    };
+    inp.onchange = () => { const f = inp.files?.[0]; if (f) void this.placeImage(f, f.name.replace(/\.[^.]+$/, '').slice(0, 24) || 'Photo'); };
     inp.click();
   }
+
+  /** decode an image and open the transform box on a new layer */
+  async placeImage(blob: Blob, name: string) {
+    this.settle(); this.closePop();
+    let bmp: ImageBitmap;
+    try {
+      bmp = await createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'default' });
+      const max = this.engine.maxTex;
+      if (Math.max(bmp.width, bmp.height) > max) {
+        const k = max / Math.max(bmp.width, bmp.height);
+        const big = bmp;
+        bmp = await createImageBitmap(big, { resizeWidth: Math.floor(big.width * k), resizeHeight: Math.floor(big.height * k), resizeQuality: 'high', premultiplyAlpha: 'none' });
+        big.close();
+      }
+    } catch { this.toast('Could not read that image'); return; }
+    const layer = this.engine.addLayerRaw(name);
+    if (!layer) { bmp.close(); this.toast('Layer limit reached for this canvas size'); return; }
+    const src = this.engine.sourceFromImage(bmp);
+    bmp.close();
+    this.startTransform(layer, src, 'insert', (commit) => {
+      if (commit) this.engine.recordInsert(layer, 'Insert image'); else this.engine.removeLayerRaw(layer);
+    });
+  }
+
+  startTransform(layer: Layer, src: Target, mode: 'insert' | 'replace', finish: (commit: boolean) => void, init?: ConstructorParameters<typeof TransformTool>[5]) {
+    this.input.grab = this.xform = new TransformTool({
+      engine: this.engine,
+      overlayChanged: () => { this.ovDirty = true; },
+      done: () => { this.input.grab = null; this.xform = null; this.ovDirty = true; },
+      toast: (m) => this.toast(m),
+    }, layer, src, mode, (commit) => { finish(commit); this.engine.freeSource(src); }, init);
+    this.ovDirty = true;
+  }
+
 
   toast(msg: string, action?: { label: string; fn: () => void }) {
     const t = $('#toast');
@@ -1019,6 +1055,7 @@ class App {
     window.addEventListener('keydown', (e) => {
       if ((e.target as HTMLElement).matches('input, select, textarea')) return;
       const k = e.key.toLowerCase();
+      if (this.xform && (k === 'enter' || k === 'escape')) { e.preventDefault(); this.xform.finish(k === 'enter'); return; }
       if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); e.shiftKey ? this.redo() : this.undo(); }
       else if ((e.ctrlKey || e.metaKey) && k === 'y') { e.preventDefault(); this.redo(); }
       else if (k === 'b') this.pickTool('brush', true);

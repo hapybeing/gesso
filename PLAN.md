@@ -19,7 +19,7 @@ Known debt: full-canvas textures rather than tiles.
 ## M2 — Workflow
 - [x] IndexedDB autosave (debounced, per-layer dirty layers, bit-exact) + Gallery (thumbnails, new/duplicate/delete/rename, canvas presets); opens to last artwork; beforeunload nag removed
 - [x] Native .gesso format (zip: manifest.json + layer PNGs, also a valid OpenRaster file) export/import; .ora import
-- [ ] Image import as layer, with transform
+- [x] Image import as layer, with transform box (move, uniform/free scale, rotate, pinch, flip, fit, smooth/sharp, snapping)
 - [x] Shape snapping (hold at stroke end: line, arc, polyline, ellipse/circle, rectangle/square, polygon; rubber-band, finger = perfect, edit handles, Freehand revert)
 - [ ] Selection: freehand, rectangle, ellipse, magic wand; mask-aware painting; invert/feather/clear
 - [ ] Transform: free, uniform, distort, warp-lite; bilinear/bicubic; flip/rotate 90

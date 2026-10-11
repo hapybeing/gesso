@@ -110,7 +110,7 @@ export class Engine {
   private dabBuf!: WebGLBuffer;
   private dabData = new Float32Array(6 * 4096);
   private pComposite!: Program; private pBake!: Program; private pMerge!: Program; private pDab!: Program;
-  private pSmudge!: Program; private pPickup!: Program; private pScreen!: Program; private pDown!: Program; private pPremul!: Program; private pFill!: Program;
+  private pSmudge!: Program; private pPickup!: Program; private pScreen!: Program; private pDown!: Program; private pPremul!: Program; private pFill!: Program; private pXform!: Program;
   private shapes = new Map<ShapeId, WebGLTexture>();
   private grains = new Map<GrainId, WebGLTexture>();
   private stroke!: Target;   // coverage buffer
@@ -155,13 +155,14 @@ export class Engine {
     this.pDown = new Program(gl, S.QUAD_VS, S.DOWNSAMPLE_FS);
     this.pPremul = new Program(gl, S.QUAD_VS, S.PREMUL_FS);
     this.pFill = new Program(gl, S.QUAD_VS, S.FILL_FS);
+    this.pXform = new Program(gl, S.XFORM_VS, S.XFORM_FS);
 
     const quad = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]);
     this.quadVao = gl.createVertexArray()!;
     gl.bindVertexArray(this.quadVao);
     const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
     // all quad programs bind aPos at location 0
-    for (const p of [this.pComposite, this.pBake, this.pMerge, this.pSmudge, this.pPickup, this.pScreen, this.pDown, this.pPremul, this.pFill]) {
+    for (const p of [this.pComposite, this.pBake, this.pMerge, this.pSmudge, this.pPickup, this.pScreen, this.pDown, this.pPremul, this.pFill, this.pXform]) {
       gl.bindAttribLocation(p.prog, 0, 'aPos'); gl.linkProgram(p.prog);
     }
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
@@ -896,6 +897,101 @@ export class Engine {
     out.getContext('2d')!.putImageData(img, 0, 0);
     return out;
   }
+
+  // ---------------------------------------------------------------- transform support
+  /** premultiplied, mipmapped copy of a straight-alpha image, to be placed with renderTransformed */
+  sourceFromImage(img: TexImageSource & { width: number; height: number }): Target {
+    const gl = this.gl;
+    const raw = textureFromCanvas(gl, img, false, false);
+    const t = makeTarget(gl, img.width, img.height);
+    bindTarget(gl, t); gl.disable(gl.BLEND);
+    this.pPremul.use().tex('uSrc', 0, raw).f('uRect', 0, 0, 1, 1);
+    this.drawQuad();
+    gl.deleteTexture(raw);
+    this.mipify(t);
+    return t;
+  }
+  /** copy of a rect of a layer as a mipmapped source */
+  sourceFromLayer(layer: Layer, r: Rect = { x: 0, y: 0, w: this.w, h: this.h }): Target {
+    const gl = this.gl, t = makeTarget(gl, r.w, r.h);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, layer.target.fb);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, t.fb);
+    gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, 0, 0, r.w, r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    this.mipify(t);
+    return t;
+  }
+  private mipify(t: Target) {
+    const gl = this.gl;
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  }
+  /**
+   * Clear dst and draw src through m = [a, b, c, d, e, f] (doc = [a c e; b d f] * src px).
+   * filter: 'sharp' = nearest; 'smooth' = trilinear when shrinking, bicubic when enlarging.
+   */
+  renderTransformed(dst: Target, src: Target, m: number[], filter: 'smooth' | 'sharp', keep?: Target | null) {
+    const gl = this.gl;
+    bindTarget(gl, dst);
+    gl.disable(gl.BLEND);
+    if (keep) { // start from existing pixels (transforming a selection inside a layer)
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, keep.fb); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fb);
+      gl.blitFramebuffer(0, 0, this.w, this.h, 0, 0, this.w, this.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      bindTarget(gl, dst);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    } else { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+    const scale = Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
+    const mode = filter === 'sharp' ? 0 : scale < 0.999 ? 1 : 2;
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mode === 0 ? gl.NEAREST : mode === 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mode === 0 ? gl.NEAREST : gl.LINEAR);
+    const grow = 1.5 / Math.max(1e-3, scale);
+    this.pXform.use().tex('uSrc', 0, src.tex).m3('uM', [m[0], m[1], 0, m[2], m[3], 0, m[4], m[5], 1])
+      .f('uSrcSize', src.w, src.h).f('uDocSize', this.w, this.h).f('uGrow', grow / src.w, grow / src.h).i('uFilter', mode);
+    this.drawQuad();
+    gl.disable(gl.BLEND);
+    this.markDirty();
+  }
+  /** add a layer above the active one without recording history (a pending transform) */
+  addLayerRaw(name: string): Layer | null {
+    if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
+    const l = new Layer(name, this.newTarget());
+    this.layers.splice(this.active + 1, 0, l); this.active++;
+    this.changed();
+    return l;
+  }
+  removeLayerRaw(layer: Layer) {
+    const i = this.layers.indexOf(layer); if (i < 0) return;
+    this.layers.splice(i, 1); freeTarget(this.gl, layer.target);
+    this.active = Math.max(0, Math.min(this.active, this.layers.length - 1)); this.changed();
+  }
+  /** record a layer that is already in the stack as an undoable insertion */
+  recordInsert(layer: Layer, label: string) {
+    const index = this.layers.indexOf(layer), prevActive = Math.max(0, index - 1);
+    const doIt = () => { this.layers.splice(index, 0, layer); this.active = index; this.changed(); };
+    this.history.push({
+      label, bytes: this.bytesPerLayer(),
+      undo: () => { this.layers.splice(this.layers.indexOf(layer), 1); this.active = Math.min(prevActive, this.layers.length - 1); this.changed(); },
+      redo: doIt,
+      dispose: (done) => { if (!done) freeTarget(this.gl, layer.target); },
+    });
+  }
+  /** record that a layer's pixels changed from `before` (a full-layer stash) to what it holds now */
+  recordReplace(layer: Layer, before: Stash, label: string) {
+    let held = before;
+    layer.version++;
+    const swap = () => {
+      const cur = new Stash(this.gl, layer.target, this.stashes);
+      layer.target = held.take();
+      held = cur;
+      layer.version++; this.changed();
+    };
+    this.history.push({ label, bytes: this.bytesPerLayer(), undo: swap, redo: swap, dispose: () => held.dispose() });
+    this.changed();
+  }
+  stashLayer(layer: Layer): Stash { return this.stashRect(layer.target, { x: 0, y: 0, w: this.w, h: this.h }); }
+  freeSource(t: Target) { freeTarget(this.gl, t); }
 
   /** debugging/testing helper: average alpha of a layer region */
   layerPixels(layer: Layer, r: Rect) { return this.readRect(layer.target, r); }

@@ -226,3 +226,47 @@ precision highp float;
 in vec2 vUv; out vec4 o;
 uniform sampler2D uLayer; uniform vec3 uColor; uniform bool uLock;
 void main(){ float a = uLock ? texture(uLayer, vUv).a : 1.0; o = vec4(uColor * a, a); }`;
+
+// Draw a (premultiplied) source texture through an affine transform into a layer.
+// The quad is grown by ~1 dest px and edges are faded by their distance in dest px, so rotated edges are anti-aliased.
+export const XFORM_VS = `#version 300 es
+in vec2 aPos;
+uniform mat3 uM;      // source px -> doc px
+uniform vec2 uSrcSize, uDocSize, uGrow;
+out vec2 vUv;
+void main(){
+  vec2 uv = mix(-uGrow, 1.0 + uGrow, aPos);
+  vec3 d = uM * vec3(uv * uSrcSize, 1.0);
+  vUv = uv;
+  gl_Position = vec4(d.xy / uDocSize * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+export const XFORM_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSrc;
+uniform vec2 uSrcSize;
+uniform int uFilter;  // 0 nearest, 1 trilinear (downscale), 2 bicubic Catmull-Rom (upscale)
+vec4 cubic(vec2 uv){
+  vec2 p = uv * uSrcSize - 0.5, f = fract(p), i = floor(p);
+  vec4 acc = vec4(0.0); float wsum = 0.0;
+  for (int y = -1; y <= 2; y++) for (int x = -1; x <= 2; x++) {
+    vec2 t = vec2(float(x), float(y)) - f;
+    vec2 a = abs(t);
+    vec2 w = mix((1.5*a - 2.5)*a*a + 1.0, ((-0.5*a + 2.5)*a - 4.0)*a + 2.0, step(1.0, a));
+    float ww = w.x * w.y;
+    acc += texture(uSrc, (i + vec2(float(x), float(y)) + 0.5) / uSrcSize) * ww; wsum += ww;
+  }
+  vec4 c = acc / wsum;
+  c.a = clamp(c.a, 0.0, 1.0);
+  return vec4(clamp(c.rgb, vec3(0.0), vec3(c.a)), c.a); // keep premultiplied and ringing-free
+}
+void main(){
+  vec2 px = vUv * uSrcSize;
+  vec2 fw = max(fwidth(px), vec2(1e-4));
+  vec2 dEdge = min(px, uSrcSize - px) / fw;           // distance to the source edge in dest px
+  float aa = clamp(min(dEdge.x, dEdge.y) + 0.5, 0.0, 1.0);
+  vec2 uv = clamp(vUv, 0.5 / uSrcSize, 1.0 - 0.5 / uSrcSize);
+  vec4 c = uFilter == 2 ? cubic(uv) : texture(uSrc, uv);
+  o = c * aa;
+}`;

@@ -197,3 +197,11 @@ input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
 #symbar .chips{flex-wrap:nowrap;gap:4px}
 #symbar .chip{padding:8px 11px}
 @media (max-width:900px){#symbar .chips{flex-wrap:wrap}}
+
+/* transform bar */
+#xfbar{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:11;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:6px 14px;
+  max-width:min(1240px,98vw);background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:6px 10px;box-shadow:0 8px 30px rgba(0,0,0,.4);animation:pop .14s ease-out}
+#xfbar .chips{flex-wrap:nowrap;gap:4px}
+#xfbar .chip{padding:8px 11px}
+#xfbar .btn{min-height:42px}
+@media (max-width:900px){#xfbar .chips{flex-wrap:wrap}}

@@ -14,6 +14,8 @@ export class Autosave {
   onState: (s: SaveState) => void = () => {};
   /** extra per-document state supplied by the app at save time */
   extra: () => Record<string, unknown> = () => ({});
+  /** a modal edit is in progress (transform box, shape handles): wait */
+  blocked: () => boolean = () => false;
   delay = 1200;
   lastError = '';
 
@@ -58,7 +60,7 @@ export class Autosave {
 
   private async run(id: string) {
     const e = this.engine;
-    while (e.stroking) await new Promise((r) => setTimeout(r, 120));
+    while (e.stroking || this.blocked()) await new Promise((r) => setTimeout(r, 150));
     if (this.docId !== id || !this.meta) return;
     const meta = this.meta;
     this.set('saving');

@@ -19,6 +19,13 @@ export interface InputHooks {
 
 export type StylusMode = 'auto' | 'pen' | 'any';
 
+/** a modal tool (transform box) that takes every canvas pointer while active */
+export interface Grab {
+  down(e: PointerEvent, x: number, y: number): void;
+  move(e: PointerEvent, x: number, y: number): void;
+  up(e: PointerEvent, x: number, y: number): void;
+}
+
 interface TouchPt { x: number; y: number; sx: number; sy: number; }
 
 export class Input {
@@ -40,6 +47,7 @@ export class Input {
   } | null = null;
   private repeatTimer: number | null = null;
   spaceDown = false;
+  grab: Grab | null = null;
 
   constructor(private el: HTMLElement, private engine: Engine, private hooks: InputHooks) {
     el.addEventListener('pointerdown', this.down, { passive: false });
@@ -83,6 +91,7 @@ export class Input {
     e.preventDefault();
     const l = this.local(e);
     try { this.el.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
+    if (this.grab) { if (e.pointerType === 'touch' && e.width * e.height > 4200) return; this.grab.down(e, l.x, l.y); return; }
     if (this.drawId === null && !this.gesture && this.touches.size === 0 && this.hooks.captureAt(l.x, l.y, e.pointerType)) { this.beginDraw(e); return; }
     if (e.pointerType === 'touch') {
       // palm: very large contact patch
@@ -159,6 +168,7 @@ export class Input {
   }
 
   private move = (e: PointerEvent) => {
+    if (this.grab) { const g = this.local(e); this.grab.move(e, g.x, g.y); return; }
     if (this.ignored.has(e.pointerId)) return;
     const l = this.local(e);
     if (this.panMouse) {
@@ -223,6 +233,7 @@ export class Input {
   }
 
   private up = (e: PointerEvent) => {
+    if (this.grab) { const g = this.local(e); this.grab.up(e, g.x, g.y); return; }
     if (this.ignored.delete(e.pointerId)) return;
     if (this.panMouse && e.pointerType === 'mouse') { this.panMouse = null; return; }
     if (e.pointerId === this.eyedropId) {
