@@ -6,15 +6,15 @@ Standard: a test must pass AND the result must feel right compared with Procreat
 - Primary: GitHub Pages at hapybeing.github.io/gesso. Waiting on him to create the repo and turn Pages on. Builds go to main (root); source goes to the `source` branch.
 - Surge is blocked (see the project notes).
 
-## M1 — Painting core [built 2026-10-12, review R1 pending]
+## M1 — Painting core [built 2026-10-12, reviewed R1 2026-10-12]
 Engine, 18 brushes, studio, layers/blends/clip/alpha-lock, colour, undo/redo, gestures, PNG, PWA.
-Known debt: full-canvas textures rather than tiles; no persistence; beforeunload nag.
+Known debt: full-canvas textures rather than tiles.
 
 ## M1.5 — Review R1 fixes (before M2)
-- [ ] Re-read engine/stroke/input, list rough edges in REVIEW.md
-- [ ] Profile on a 1280x800 tablet viewport at DPR 2: 120 Hz-style pen stream (getCoalescedEvents), measure ms per frame for dabs + composite
-- [ ] Brush feel against Procreate: pressure curve UI, stabilisation vs streamline, taper and speed response, smoothing lag
-- [ ] UI polish: one-handed reach, sidebar size/opacity sliders, quick undo button, 44px targets
+- [x] Re-read engine/stroke/input, list rough edges in REVIEW.md
+- [x] Profile on a 1280x800 tablet viewport at DPR 2: 120 Hz-style pen stream (getCoalescedEvents), measure ms per frame for dabs + composite
+- [x] Brush feel against Procreate: pressure curve UI, stabilisation vs streamline, taper and speed response, smoothing lag
+- [x] UI polish: one-handed reach, sidebar size/opacity sliders, quick undo button, 44px targets
 
 ## M2 — Workflow
 - [ ] IndexedDB autosave (debounced, per-layer dirty tiles) + Gallery (thumbnails, new/duplicate/delete/rename, canvas presets)

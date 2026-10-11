@@ -1,7 +1,8 @@
 import { Engine, Tool, BLEND_MODES, Layer } from './engine';
 import { BRUSHES, Brush, SHAPES, GRAINS, makeShape, ShapeId } from './brushes';
-import { StrokeBuilder, Sample } from './stroke';
+import { StrokeBuilder, Sample, PressureCurve } from './stroke';
 import { Input, StylusMode } from './input';
+import { pressureSection } from './pressureui';
 import { RGB, HSV, hsvToRgb, rgbToHsv, toHex, fromHex } from './color';
 
 // ------------------------------------------------------------------ helpers
@@ -49,7 +50,7 @@ const ICON = {
 };
 
 // ------------------------------------------------------------------ persisted state
-interface Settings { stylus: StylusMode; gamma: number; leftRail: boolean; }
+interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; }
 interface State {
   toolBrush: Record<Tool, string>;
   color: RGB; recent: string[];
@@ -59,7 +60,7 @@ interface State {
 const DEFAULT_STATE: State = {
   toolBrush: { brush: 'ink-studio', eraser: 'air-hard', smudge: 'smudge-soft' },
   color: [0.12, 0.11, 0.1], recent: [],
-  settings: { stylus: 'auto', gamma: 1, leftRail: true },
+  settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true },
   overrides: {},
 };
 const store = {
@@ -67,7 +68,12 @@ const store = {
     try { const s = JSON.parse(localStorage.getItem('gesso.v1') || '{}'); return { ...DEFAULT_STATE, ...s, settings: { ...DEFAULT_STATE.settings, ...(s.settings || {}) }, toolBrush: { ...DEFAULT_STATE.toolBrush, ...(s.toolBrush || {}) } }; }
     catch { return structuredClone(DEFAULT_STATE); }
   },
-  save(s: State) { try { localStorage.setItem('gesso.v1', JSON.stringify(s)); } catch { /* quota */ } },
+  timer: 0 as number,
+  save(s: State) {
+    // debounced: sliders call this on every move
+    clearTimeout(store.timer);
+    store.timer = window.setTimeout(() => { try { localStorage.setItem('gesso.v1', JSON.stringify(s)); } catch { /* quota */ } }, 250);
+  },
 };
 
 const PALETTE = ['#1d1b19', '#4a4038', '#8c7b6b', '#d9cbb8', '#f6f0e6', '#ffffff',
@@ -81,7 +87,8 @@ class App {
   state = store.load();
   tool: Tool = 'brush';
   builder: StrokeBuilder | null = null;
-  pendingDabs: Sample[] = [];
+  curve = new PressureCurve();
+  strokeTool: Tool = 'brush';
   eyedropOnce = false;
   pop: HTMLElement | null = null;
   popKind = '';
@@ -96,7 +103,7 @@ class App {
     try { this.engine = new Engine(this.canvas); }
     catch (err) { this.fatal(String((err as Error).message || err)); throw err; }
     this.input = new Input(this.canvas, this.engine, {
-      strokeStart: (s, t) => this.strokeStart(s, t),
+      strokeStart: (s, t, er) => this.strokeStart(s, t, er),
       strokeMove: (s) => this.strokeMove(s),
       strokeEnd: () => this.strokeEnd(),
       strokeCancel: () => { this.engine.cancelStroke(); this.builder = null; },
@@ -106,6 +113,8 @@ class App {
       eyedropArmed: () => this.eyedropOnce,
     });
     this.input.stylusMode = this.state.settings.stylus;
+    this.curve.set(...this.state.settings.curve);
+    this.engine.history.maxSteps = 250;
     this.loupe = h('div', { class: 'loupe' });
     document.body.append(this.loupe);
     this.buildUI();
@@ -141,14 +150,17 @@ class App {
   save() { store.save(this.state); }
 
   // ---------------------------------------------------------------- strokes
-  strokeStart(s: Sample, _type: string) {
+  strokeStart(s: Sample, _type: string, eraserEnd = false) {
     this.closePop();
     const layer = this.engine.activeLayer;
     if (!layer) return false;
     if (!layer.visible) { this.toast('This layer is hidden'); return false; }
-    const brush = this.brushFor(this.tool);
-    if (!this.engine.beginStroke(this.tool, brush, this.state.color)) return false;
-    this.builder = new StrokeBuilder(brush, this.state.settings.gamma);
+    const tool: Tool = eraserEnd ? 'eraser' : this.tool;
+    this.strokeTool = tool;
+    const brush = this.brushFor(tool);
+    if (!this.engine.beginStroke(tool, brush, this.state.color)) return false;
+    const preset = BRUSHES.find((b) => b.id === brush.id);
+    this.builder = new StrokeBuilder(brush, { curve: this.curve, viewScale: this.engine.view.scale, sizeRatio: preset ? brush.size / preset.size : 1 });
     this.engine.addDabs(this.builder.start(s));
     return true;
   }
@@ -382,7 +394,7 @@ class App {
     if (this.tool === 'smudge') slider(s, 'Smudge strength', 'smudge', 0, 1, 0.01, pct);
     s = sec('Stroke');
     slider(s, 'Spacing', 'spacing', 0.01, 1, 0.01, pct);
-    slider(s, 'StreamLine', 'smoothing', 0, 1, 0.01, pct);
+    slider(s, 'Smoothing', 'smoothing', 0, 1, 0.01, pct);
     slider(s, 'Size jitter', 'sizeJitter', 0, 1, 0.01, pct);
     slider(s, 'Opacity jitter', 'opacityJitter', 0, 1, 0.01, pct);
     slider(s, 'Scatter', 'scatter', 0, 1.5, 0.01, pct);
@@ -636,24 +648,13 @@ class App {
         seg.append(h('button', { class: 'chip' + (st.stylus === v ? ' on' : ''), onClick: () => { st.stylus = v; this.input.stylusMode = v; this.save(); drawSeg(); } }, label));
     };
     drawSeg();
-    const gamma = h('input', { type: 'range', min: 0.4, max: 2.5, step: 0.05, value: st.gamma }) as HTMLInputElement;
-    const gv = h('span', { class: 'sv' }, st.gamma.toFixed(2));
-    const curve = h('canvas', { width: 120, height: 120, class: 'curve' }) as HTMLCanvasElement;
-    const drawCurve = () => {
-      const g = curve.getContext('2d')!; g.clearRect(0, 0, 120, 120);
-      g.strokeStyle = '#555'; g.strokeRect(0.5, 0.5, 119, 119);
-      g.strokeStyle = '#e8a54b'; g.lineWidth = 2; g.beginPath();
-      for (let i = 0; i <= 40; i++) { const x = i / 40, y = Math.pow(x, st.gamma); g.lineTo(x * 118 + 1, 119 - y * 118); }
-      g.stroke();
-    };
-    gamma.oninput = () => { st.gamma = +gamma.value; gv.textContent = st.gamma.toFixed(2); drawCurve(); this.save(); };
-    drawCurve();
+    const pres = pressureSection(this.curve, st.curve, (c) => { st.curve = c; this.save(); });
     const rail = h('input', { type: 'checkbox' }) as HTMLInputElement;
     rail.checked = !st.leftRail;
     rail.onchange = () => { st.leftRail = !rail.checked; $('#rail').classList.toggle('right', rail.checked); this.save(); };
     s.body.append(
       h('section', {}, h('h4', {}, 'Touch & stylus'), seg, h('p', { class: 'muted' }, 'Palm rejection: in Auto, once Gesso sees your stylus, fingers only pan, zoom, rotate, undo and pick colours. Large contact patches (a resting palm) are always ignored.')),
-      h('section', {}, h('h4', {}, 'Pressure curve'), h('div', { class: 'row' }, curve, h('label', { class: 'srow grow' }, h('span', {}, 'Softer ↔ firmer'), gamma, gv))),
+      pres,
       h('section', {}, h('h4', {}, 'Layout'), h('label', { class: 'srow' }, h('span', {}, 'Sidebar on the right'), rail)),
     );
   }

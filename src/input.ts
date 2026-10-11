@@ -2,7 +2,7 @@ import type { Engine } from './engine';
 import type { Sample } from './stroke';
 
 export interface InputHooks {
-  strokeStart(s: Sample, pointerType: string): boolean;
+  strokeStart(s: Sample, pointerType: string, eraserEnd: boolean): boolean;
   strokeMove(s: Sample[]): void;
   strokeEnd(): void;
   strokeCancel(): void;
@@ -32,8 +32,9 @@ export class Input {
   private gesture: {
     t0: number; maxTouches: number; moved: boolean;
     v0: { x: number; y: number; scale: number; rot: number };
-    ids: number[]; p0: [TouchPt, TouchPt] | null;
+    ids: number[]; p0: [TouchPt, TouchPt] | null; held: boolean;
   } | null = null;
+  private repeatTimer: number | null = null;
   spaceDown = false;
 
   constructor(private el: HTMLElement, private engine: Engine, private hooks: InputHooks) {
@@ -57,13 +58,14 @@ export class Input {
     const pen = e.pointerType === 'pen';
     let p = pen ? e.pressure : 1;
     if (pen && p === 0 && e.buttons) p = 0.02;
-    return { x: d.x, y: d.y, p, tx: pen ? e.tiltX || 0 : 0, ty: pen ? e.tiltY || 0 : 0 };
+    return { x: d.x, y: d.y, p, tx: pen ? e.tiltX || 0 : 0, ty: pen ? e.tiltY || 0 : 0, t: e.timeStamp };
   }
   private touchDraws() {
     if (this.stylusMode === 'pen') return false;
     if (this.stylusMode === 'any') return true;
     return !this.penSeen;
   }
+  private stopRepeat() { if (this.repeatTimer !== null) { clearTimeout(this.repeatTimer); this.repeatTimer = null; } }
   private clearHold() { if (this.holdTimer !== null) { clearTimeout(this.holdTimer); this.holdTimer = null; } }
 
   private startEyedrop(id: number, sx: number, sy: number) {
@@ -116,7 +118,8 @@ export class Input {
   };
 
   private beginDraw(e: PointerEvent) {
-    const ok = this.hooks.strokeStart(this.sample(e), e.pointerType);
+    // buttons bit 32 = the eraser end of a stylus (or its eraser barrel button)
+    const ok = this.hooks.strokeStart(this.sample(e), e.pointerType, e.pointerType === 'pen' && (e.buttons & 32) !== 0);
     if (!ok) return;
     this.drawId = e.pointerId;
     this.drawType = e.pointerType;
@@ -132,8 +135,21 @@ export class Input {
       t0: prev ? prev.t0 : performance.now(),
       maxTouches: Math.max(prev ? prev.maxTouches : 0, this.touches.size),
       moved: prev ? prev.moved : false,
-      v0: { ...this.engine.view }, ids, p0,
+      v0: { ...this.engine.view }, ids, p0, held: prev ? prev.held : false,
     };
+    // two fingers held still: rapid undo, accelerating, until they lift
+    if (this.touches.size === 2 && !prev) {
+      this.stopRepeat();
+      let delay = 260;
+      const fire = () => {
+        const g = this.gesture;
+        if (!g || g.moved || this.touches.size !== 2) { this.repeatTimer = null; return; }
+        g.held = true; this.hooks.undo();
+        delay = Math.max(70, delay * 0.82);
+        this.repeatTimer = window.setTimeout(fire, delay);
+      };
+      this.repeatTimer = window.setTimeout(fire, 650);
+    }
   }
 
   private move = (e: PointerEvent) => {
@@ -219,11 +235,12 @@ export class Input {
         if (this.touches.size === 0) {
           const g = this.gesture;
           this.gesture = null;
-          if (!g.moved && performance.now() - g.t0 < 380) {
+          this.stopRepeat();
+          if (!g.moved && !g.held && performance.now() - g.t0 < 380) {
             if (g.maxTouches === 2) this.hooks.undo();
             else if (g.maxTouches === 3) this.hooks.redo();
           }
-        } else this.beginGesture();
+        } else { this.stopRepeat(); this.beginGesture(); }
       }
     }
     if (e.pointerId === this.drawId) {

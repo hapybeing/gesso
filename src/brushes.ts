@@ -132,7 +132,8 @@ export function makeShape(id: ShapeId): HTMLCanvasElement {
     }
     case 'bristle': {
       const hairs: [number, number][] = [];
-      for (let i = 0; i < 26; i++) hairs.push([(r() * 2 - 1) * 0.92, 0.35 + r() * 0.65]);
+      // stratified so hairs cover the whole tip (random placement left a visible bald band)
+      for (let i = 0; i < 30; i++) hairs.push([-0.92 + ((i + 0.2 + r() * 0.6) / 30) * 1.84, 0.35 + r() * 0.65]);
       put((x, y) => {
         let v = 0;
         for (const [hx, hs] of hairs) { const dd = Math.abs(y - hx); if (dd < 0.07) v = Math.max(v, (1 - dd / 0.07) * hs); }

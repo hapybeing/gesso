@@ -101,3 +101,50 @@ export function textureFromCanvas(gl: GL, c: TexImageSource, repeat = false, mip
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, w);
   return t;
 }
+
+/** Asynchronous pixel readback through a PIXEL_PACK_BUFFER + fence: never stalls the GPU pipeline. */
+export class Readback {
+  private buf: WebGLBuffer | null;
+  private sync: WebGLSync | null;
+  data: Uint8Array | null = null;
+  readonly bytes: number;
+  constructor(private gl: GL, fb: WebGLFramebuffer, x: number, y: number, w: number, h: number) {
+    this.bytes = w * h * 4;
+    this.buf = gl.createBuffer();
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.buf);
+    gl.bufferData(gl.PIXEL_PACK_BUFFER, this.bytes, gl.STREAM_READ);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fb);
+    gl.readPixels(x, y, w, h, gl.RGBA, gl.UNSIGNED_BYTE, 0);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    this.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+  }
+  /** true once the data has arrived (copies it out of the buffer on the first true) */
+  poll(): boolean {
+    if (this.data) return true;
+    if (!this.sync) return false;
+    const gl = this.gl;
+    const st = gl.clientWaitSync(this.sync, 0, 0);
+    if (st === gl.TIMEOUT_EXPIRED || st === gl.WAIT_FAILED) return false;
+    const out = new Uint8Array(this.bytes);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, this.buf);
+    gl.getBufferSubData(gl.PIXEL_PACK_BUFFER, 0, out);
+    gl.bindBuffer(gl.PIXEL_PACK_BUFFER, null);
+    this.data = out;
+    this.dispose();
+    return true;
+  }
+  /** resolves when the data has arrived (polled on animation frames / timers) */
+  wait(): Promise<Uint8Array> {
+    return new Promise((res) => {
+      const tick = () => { if (this.poll()) res(this.data!); else setTimeout(tick, 8); };
+      tick();
+    });
+  }
+  dispose() {
+    const gl = this.gl;
+    if (this.sync) { gl.deleteSync(this.sync); this.sync = null; }
+    if (this.buf) { gl.deleteBuffer(this.buf); this.buf = null; }
+  }
+}

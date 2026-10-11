@@ -19,17 +19,17 @@ input,select{font:inherit;color:var(--ink)}
 .ib{width:44px;height:44px;border-radius:999px;display:grid;place-items:center;color:var(--ink);transition:background .15s,color .15s}
 .ib:active{background:rgba(255,255,255,.08)}
 .ib.on{color:#1c1a19;background:var(--accent)}
-.ib.small{width:36px;height:36px}
+.ib.small{width:44px;height:44px}
 .ib.small svg{width:20px;height:20px}
 .brand{display:flex;align-items:center;gap:8px;height:44px;padding:0 14px 0 8px;border-radius:999px;font-weight:700;letter-spacing:.3px;font-size:17px}
 .logo{width:26px;height:26px;border-radius:8px;background:url(icons/icon-192.png) center/cover}
-.swatch{width:36px;height:36px;margin:4px;border-radius:999px;border:3px solid #fff3;box-shadow:inset 0 0 0 2px rgba(0,0,0,.35)}
+.swatch{width:40px;height:40px;margin:2px;border-radius:999px;border:3px solid #fff3;box-shadow:inset 0 0 0 2px rgba(0,0,0,.35)}
 
 /* side rail */
 #rail{position:absolute;left:10px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;align-items:center;gap:8px;padding:10px 6px;
   background:var(--panel);border:1px solid var(--line);border-radius:999px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
 #rail.right{left:auto;right:10px}
-.vs{position:relative;width:36px;height:170px;border-radius:999px;background:rgba(255,255,255,.06);touch-action:none;overflow:visible}
+.vs{position:relative;width:40px;height:180px;border-radius:999px;background:rgba(255,255,255,.06);touch-action:none;overflow:visible}
 .vs .fillbar{position:absolute;left:0;right:0;bottom:0;border-radius:999px;background:linear-gradient(rgba(232,165,75,.55),rgba(232,165,75,.25))}
 .vs[data-kind=opacity] .fillbar{background:linear-gradient(rgba(241,233,221,.5),rgba(241,233,221,.15))}
 .vs .thumb{position:absolute;left:4px;right:4px;height:20px;border-radius:999px;background:var(--ink);box-shadow:0 2px 6px rgba(0,0,0,.4)}
@@ -45,7 +45,7 @@ input,select{font:inherit;color:var(--ink)}
 .pop-head{display:flex;align-items:center;gap:10px;margin-bottom:10px}
 .pop-head b{font-size:17px;flex:1}
 .muted{color:var(--muted);font-size:13px}
-.chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;background:rgba(255,255,255,.06);font-size:14px;min-height:36px}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,.06);font-size:14px;min-height:44px}
 .chip svg{width:18px;height:18px}
 .chip.on{background:var(--accent);color:#1c1a19}
 .chips{display:flex;flex-wrap:wrap;gap:6px}
@@ -137,3 +137,9 @@ input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
   background:linear-gradient(var(--new) 50%,var(--old) 50%);border:5px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.4)}
 .fatal{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px;text-align:center;background:var(--bg);z-index:99}
 @media (max-width:640px){ .vs{height:120px} .groups{min-width:90px} }
+
+/* pressure */
+.prow{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.pcurve{border-radius:12px;touch-action:none}
+.pcol{flex:1;min-width:260px;display:flex;flex-direction:column;gap:8px}
+.ppad{width:100%;max-width:360px;aspect-ratio:360/150;background:#151312;border-radius:12px;touch-action:none;border:1px dashed rgba(255,255,255,.15)}

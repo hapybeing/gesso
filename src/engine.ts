@@ -1,4 +1,4 @@
-import { GL, Program, Target, makeTarget, freeTarget, bindTarget, textureFromCanvas, makeTexture } from './gl';
+import { GL, Program, Target, makeTarget, freeTarget, bindTarget, textureFromCanvas, makeTexture, Readback } from './gl';
 import * as S from './shaders';
 import { Brush, ShapeId, GrainId, makeShape, makeGrain } from './brushes';
 import { History, Entry } from './history';
@@ -39,6 +39,58 @@ const unionRect = (a: Rect | null, b: Rect): Rect => {
   return { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
 };
 
+/**
+ * Pixels kept for undo. Starts life as a GPU texture (instant to take and restore, no pipeline stall) and is
+ * migrated to CPU memory in the background by an async PBO readback once the GPU budget is exceeded.
+ */
+export class Stash {
+  t: Target | null;
+  data: Uint8Array | null = null;
+  private rb: Readback | null = null;
+  readonly w: number; readonly h: number;
+  constructor(private gl: GL, t: Target, private registry: Set<Stash>) {
+    this.t = t; this.w = t.w; this.h = t.h;
+    registry.add(this);
+  }
+  get bytes() { return this.w * this.h * 4; }
+  get onGpu() { return !!this.t; }
+  migrate() { if (this.t && !this.rb) this.rb = new Readback(this.gl, this.t.fb, 0, 0, this.w, this.h); }
+  get migrating() { return !!this.rb; }
+  poll() {
+    if (this.rb && this.rb.poll()) { this.data = this.rb.data; this.rb = null; if (this.t) freeTarget(this.gl, this.t); this.t = null; }
+  }
+  /** copy the stashed pixels into dst at (x, y) */
+  writeTo(dst: Target, x: number, y: number) {
+    const gl = this.gl;
+    if (this.t) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.t.fb);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fb);
+      gl.blitFramebuffer(0, 0, this.w, this.h, x, y, x + this.w, y + this.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    } else if (this.data) {
+      gl.bindTexture(gl.TEXTURE_2D, dst.tex);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, this.w, this.h, gl.RGBA, gl.UNSIGNED_BYTE, this.data);
+    }
+  }
+  /** turn the stash into a standalone full texture (consumes the stash) */
+  take(): Target {
+    let t = this.t;
+    if (t) { this.t = null; }
+    else { t = makeTarget(this.gl, this.w, this.h); this.writeTo(t, 0, 0); }
+    this.dispose();
+    return t;
+  }
+  dispose() {
+    this.rb?.dispose(); this.rb = null;
+    if (this.t) freeTarget(this.gl, this.t);
+    this.t = null; this.data = null;
+    this.registry.delete(this);
+  }
+}
+
+export interface EngineStats { dabs: number; compositePx: number; presents: number; presentPx: number; }
+
 export class Engine {
   gl: GL;
   w = 0; h = 0;
@@ -67,6 +119,11 @@ export class Engine {
   private dirty: Rect | null = null;
   needsPresent = true;
   maxTex: number;
+  /** undo pixel stashes; GPU-resident ones beyond this budget migrate to CPU memory */
+  readonly stashes = new Set<Stash>();
+  gpuStashBudget = 160 * 1024 * 1024;
+  stats: EngineStats = { dabs: 0, compositePx: 0, presents: 0, presentPx: 0 };
+  private mipStale = true;
   onLayersChanged: () => void = () => {};
 
   // view: doc px -> screen css px
@@ -153,8 +210,21 @@ export class Engine {
     this.s1 = makeTarget(gl, w, h); this.s2 = makeTarget(gl, w, h);
     this.layers = [new Layer('Layer 1', makeTarget(gl, w, h))];
     this.active = 0;
+    this.warmup();
     this.markDirty();
     this.onLayersChanged();
+  }
+
+  /** run every stroke-path shader once on an invisible dab so the first real stroke does not hitch on compilation */
+  private warmup() {
+    const b = { id: 'warm', name: '', group: '', shape: 'hard', grain: 'paper', mode: 'paint', size: 2, minSize: 1, opacity: 1, flow: 0, spacing: 1,
+      sizeJitter: 0, opacityJitter: 0, scatter: 0, rotJitter: 0, followDir: false, roundness: 1, angle: 0, taperStart: 0, taperEnd: 0,
+      pressSize: 0, pressOpacity: 0, tiltSize: 0, grainScale: 1, grainDepth: 0.5, wetEdges: 0.5, smoothing: 0, smudge: 0 } as Brush;
+    this.beginStroke('brush', b, [0, 0, 0]);
+    this.addDabs([{ x: 1, y: 1, r: 1, a: 0, angle: 0, aspect: 1 }]);
+    this.composite({ x: 0, y: 0, w: 4, h: 4 });
+    this.endStroke();
+    this.history.clear();
   }
 
   get activeLayer() { return this.layers[this.active]; }
@@ -231,6 +301,8 @@ export class Engine {
       this.drawQuad();
       const t = src; src = dst; dst = t;
     }
+    this.stats.compositePx += r.w * r.h * Math.max(1, this.layers.length);
+    this.mipStale = true;
     // copy result into comp
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.comp.fb);
@@ -258,8 +330,20 @@ export class Engine {
     return { x: c * px - s * py, y: s * px + c * py };
   }
 
+  /** poll background readbacks; migrate the oldest GPU stashes when over budget */
+  private maintainStashes() {
+    let gpu = 0;
+    for (const s of this.stashes) { s.poll(); if (s.onGpu && !s.migrating) gpu += s.bytes; }
+    if (gpu <= this.gpuStashBudget) return;
+    for (const s of this.stashes) {          // insertion order = oldest first
+      if (gpu <= this.gpuStashBudget * 0.75) break;
+      if (s.onGpu && !s.migrating) { s.migrate(); gpu -= s.bytes; }
+    }
+  }
+
   render() {
     const gl = this.gl;
+    if (!this.cur) this.maintainStashes();
     if (this.dirty) {
       this.composite(this.dirty);
       this.dirty = null;
@@ -279,7 +363,9 @@ export class Engine {
     gl.activeTexture(gl.TEXTURE0);
     gl.bindTexture(gl.TEXTURE_2D, this.comp.tex);
     const zoomedOut = this.view.scale * dpr < 0.8;
-    if (zoomedOut) gl.generateMipmap(gl.TEXTURE_2D);
+    // regenerate mips only when the composite actually changed (not on pan/zoom-only frames)
+    if (zoomedOut && this.mipStale) { gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false; }
+    this.stats.presents++; this.stats.presentPx += cw * ch;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, zoomedOut ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, this.view.scale * dpr > 3 ? gl.NEAREST : gl.LINEAR);
     p.i('uComp', 0);
@@ -316,6 +402,7 @@ export class Engine {
     const c = this.cur;
     if (!c || !dabs.length) return;
     c.dabs.push(...dabs);
+    this.stats.dabs += dabs.length;
     let rect: Rect | null = null;
     for (const d of dabs) rect = unionRect(rect, this.dabRect(d));
     c.bbox = unionRect(c.bbox, rect!);
@@ -424,6 +511,33 @@ export class Engine {
     return { x: r.x - wet, y: r.y - wet, w: r.w + wet * 2, h: r.h + wet * 2 };
   }
 
+  /** copy a rect of a target into a new GPU stash */
+  stashRect(src: Target, r: Rect): Stash {
+    const gl = this.gl, t = makeTarget(gl, r.w, r.h);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb);
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, t.fb);
+    gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, 0, 0, r.w, r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    return new Stash(gl, t, this.stashes);
+  }
+
+  /**
+   * Undoable rect edit with swap semantics: the entry always holds the pixels of the state it is not in,
+   * so one buffer per step serves both undo and redo (half the memory of before+after copies).
+   */
+  pushRectEdit(layer: Layer, rect: Rect, before: Stash, label: string) {
+    let held = before;
+    const swap = () => {
+      const now = this.stashRect(layer.target, rect);
+      held.writeTo(layer.target, rect.x, rect.y);
+      held.dispose();
+      held = now;
+      layer.version++;
+      this.markDirty(rect);
+      this.onLayersChanged();
+    };
+    this.history.push({ label, bytes: rect.w * rect.h * 4, undo: swap, redo: swap, dispose: () => held.dispose() });
+  }
+
   endStroke() {
     const c = this.cur;
     if (!c) return;
@@ -432,31 +546,32 @@ export class Engine {
     const rect = this.clampRect(this.padRectFor(c, c.bbox));
     if (!rect) { this.cancelStroke(); return; }
     const layer = c.layer;
-    let before: Uint8Array;
+    let before: Stash;
     if (c.tool === 'smudge') {
-      before = this.readRect(this.snapshot!, rect);
+      before = this.stashRect(this.snapshot!, rect);
     } else {
-      before = this.readRect(layer.target, rect);
-      // bake: layer+stroke -> s1, swap textures
+      before = this.stashRect(layer.target, rect);
+      // bake layer+stroke into s1 inside the stroke rect only, then copy that rect back into the layer
       bindTarget(gl, this.s1);
       gl.disable(gl.BLEND);
+      gl.enable(gl.SCISSOR_TEST); gl.scissor(rect.x, rect.y, rect.w, rect.h);
       const p = this.pBake.use();
       this.setStrokeUniforms(p, layer);
       p.tex('uLayer', 0, layer.target.tex);
       this.drawQuad();
-      const old = layer.target; layer.target = this.s1; this.s1 = old;
+      gl.disable(gl.SCISSOR_TEST);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.s1.fb);
+      gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, layer.target.fb);
+      gl.blitFramebuffer(rect.x, rect.y, rect.x + rect.w, rect.y + rect.h, rect.x, rect.y, rect.x + rect.w, rect.y + rect.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     }
-    const after = this.readRect(layer.target, rect);
     this.cur = null;
     layer.version++;
     this.markDirty(rect);
     const label = c.tool === 'eraser' ? 'Erase' : c.tool === 'smudge' ? 'Smudge' : 'Stroke';
-    this.history.push({
-      label, bytes: before.byteLength * 2,
-      undo: () => { this.writeRect(layer, rect, before); },
-      redo: () => { this.writeRect(layer, rect, after); },
-    });
+    this.pushRectEdit(layer, rect, before, label);
+    this.onStrokeCommitted();
   }
+  onStrokeCommitted: () => void = () => {};
 
   readRect(t: Target, r: Rect): Uint8Array {
     const gl = this.gl;
@@ -593,17 +708,18 @@ export class Engine {
     this.history.push({ label: 'Move layer', bytes: 64, undo: () => apply(to, from), redo: () => apply(from, to) });
   }
 
-  /** swap a layer's pixels for a newly rendered target, undoably */
+  /** swap a layer's pixels for a newly rendered target, undoably (old pixels held as a migratable stash) */
   private replaceTarget(layer: Layer, next: Target, label: string) {
-    const old = layer.target;
+    let held = new Stash(this.gl, layer.target, this.stashes);
     layer.target = next; layer.version++;
     this.changed();
-    this.history.push({
-      label, bytes: this.bytesPerLayer(),
-      undo: () => { layer.target = old; layer.version++; this.changed(); },
-      redo: () => { layer.target = next; layer.version++; this.changed(); },
-      dispose: (done) => freeTarget(this.gl, done ? old : next),
-    });
+    const swap = () => {
+      const cur = new Stash(this.gl, layer.target, this.stashes);
+      layer.target = held.take();
+      held = cur;
+      layer.version++; this.changed();
+    };
+    this.history.push({ label, bytes: this.bytesPerLayer(), undo: swap, redo: swap, dispose: () => held.dispose() });
   }
 
   clearLayer() { this.replaceTarget(this.activeLayer, this.newTarget(), 'Clear layer'); }

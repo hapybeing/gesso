@@ -3,7 +3,7 @@ const http = require('http'), fs = require('fs'), path = require('path');
 const root = path.join(__dirname, '..', 'dist');
 const srv = http.createServer((q, r) => { let p = decodeURIComponent(q.url.split('?')[0]); if (p.endsWith('/')) p += 'index.html'; fs.readFile(path.join(root, p), (e, d) => { if (e) { r.writeHead(404); r.end(); return; } r.writeHead(200, {'content-type': p.endsWith('.js')?'text/javascript':p.endsWith('.css')?'text/css':'text/html'}); r.end(d); }); }).listen(8124);
 (async () => {
-  const browser = await chromium.launch({ executablePath: '/usr/bin/chromium', args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--no-sandbox'] });
+  const browser = await chromium.launch({ executablePath: require('./chrome.cjs'), args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--no-sandbox'] });
   const page = await (await browser.newContext({ viewport: { width: 1000, height: 700 } })).newPage();
   page.on('pageerror', (e) => console.log('ERR', e.message));
   await page.goto('http://localhost:8124/?w=800&h=600'); await page.waitForTimeout(500);
