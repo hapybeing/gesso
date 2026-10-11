@@ -179,8 +179,10 @@ export class TilePool {
    * A readable full-size texture of the layer without making it resident: its own texture when resident,
    * otherwise a shared scratch texture filled from the tiles (valid until the next call).
    */
+  private scratchUse = 0;
   readable(l: TiledLayer): Target {
     if (l.res) return l.res;
+    this.scratchUse = this.frame;
     const { w, h } = this.size();
     if (!this.scratch || this.scratch.w !== w || this.scratch.h !== h) {
       if (this.scratch) freeTarget(this.gl, this.scratch);
@@ -262,6 +264,8 @@ export class TilePool {
    */
   maintain(keep: Set<TiledLayer>) {
     this.frame++;
+    // the read-only scratch copy is a full canvas of memory: give it back when thumbnails/exports are done
+    if (this.scratch && this.frame - this.scratchUse > this.idleFrames * 4) { freeTarget(this.gl, this.scratch); this.scratch = null; }
     for (const [l, e] of this.pending) {
       if (keep.has(l)) { this.cancelEvict(l); continue; }
       if (e.rb.poll()) { this.pending.delete(l); this.finishEvict(e, e.rb.data!); }
