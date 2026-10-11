@@ -6,6 +6,8 @@ export interface InputHooks {
   strokeMove(s: Sample[]): void;
   strokeEnd(): void;
   strokeCancel(): void;
+  /** predicted pen positions just ahead of the latest sample (getPredictedEvents), replaced on every move */
+  strokePredict?(s: Sample[]): void;
   undo(): void;
   redo(): void;
   eyedrop(docX: number, docY: number, done: boolean, sx: number, sy: number): void;
@@ -200,6 +202,10 @@ export class Input {
       const samples = list.map((x) => this.sample(x));
       this.drawMoved += samples.length;
       this.hooks.strokeMove(samples);
+      if (this.hooks.strokePredict) {
+        const pr = (typeof e.getPredictedEvents === 'function' ? e.getPredictedEvents() : []) as PointerEvent[];
+        this.hooks.strokePredict(pr.map((x) => this.sample(x)));
+      }
     }
   };
 

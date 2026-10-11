@@ -215,3 +215,59 @@ export function makeGrain(id: GrainId): HTMLCanvasElement {
   g.putImageData(img, 0, 0);
   return c;
 }
+
+// ---------------------------------------------------------------- brush files (.gessobrush)
+// JSON: { format: "gesso-brush", version: 1, brushes: [Brush…] }. Tips and grains are procedural ids, so a file is
+// tiny and fully portable. Imported brushes live in localStorage and show in the "Imported" group.
+const NUM_RANGE: Partial<Record<keyof Brush, [number, number]>> = {
+  size: [0.5, 1000], minSize: [0, 1], opacity: [0, 1], flow: [0, 1], spacing: [0.01, 2], sizeJitter: [0, 1], opacityJitter: [0, 1], scatter: [0, 4],
+  rotJitter: [0, 1], roundness: [0.05, 1], angle: [-360, 360], taperStart: [0, 2000], taperEnd: [0, 2000], pressSize: [0, 1], pressOpacity: [0, 1],
+  tiltSize: [0, 1], grainScale: [0.1, 20], grainDepth: [0, 1], wetEdges: [0, 1], smoothing: [0, 1], smudge: [0, 1], wet: [0, 1], granulation: [0, 1],
+};
+/** a safe Brush from untrusted JSON (unknown keys dropped, numbers clamped, ids checked), or null */
+export function validateBrush(o: unknown): Brush | null {
+  if (!o || typeof o !== 'object') return null;
+  const src = o as Record<string, unknown>;
+  const b: Brush = { ...base, id: '', name: '', group: 'Imported' } as Brush;
+  b.name = String(src.name ?? 'Brush').slice(0, 40) || 'Brush';
+  b.id = String(src.id ?? '').replace(/[^\w-]/g, '').slice(0, 40) || 'brush';
+  if (SHAPES.includes(src.shape as ShapeId)) b.shape = src.shape as ShapeId;
+  if (GRAINS.includes(src.grain as GrainId)) b.grain = src.grain as GrainId;
+  b.mode = src.mode === 'smudge' ? 'smudge' : 'paint';
+  b.followDir = !!src.followDir;
+  for (const [k, [lo, hi]] of Object.entries(NUM_RANGE) as [keyof Brush, [number, number]][]) {
+    const v = Number(src[k]);
+    if (Number.isFinite(v)) (b as unknown as Record<string, number>)[k] = Math.max(lo, Math.min(hi, v));
+  }
+  return b;
+}
+export function brushFile(list: Brush[]): string {
+  return JSON.stringify({ format: 'gesso-brush', version: 1, brushes: list.map((b) => ({ ...b, group: undefined })) }, null, 1);
+}
+export function parseBrushFile(text: string): Brush[] {
+  const j = JSON.parse(text);
+  if (j?.format !== 'gesso-brush') throw new Error('Not a Gesso brush file');
+  if (j.version > 1) throw new Error('Made by a newer Gesso');
+  const out = (Array.isArray(j.brushes) ? j.brushes : []).map(validateBrush).filter(Boolean) as Brush[];
+  if (!out.length) throw new Error('No brushes in the file');
+  return out;
+}
+const CUSTOM_KEY = 'gesso.brushes';
+/** add brushes to the library (ids made unique), persisted */
+export function addCustomBrushes(list: Brush[]): Brush[] {
+  const added: Brush[] = [];
+  for (const b0 of list) {
+    let id = 'imp-' + b0.id, n = 2;
+    while (BRUSHES.some((x) => x.id === id)) id = 'imp-' + b0.id + '-' + n++;
+    const b = { ...b0, id, group: 'Imported' };
+    BRUSHES.push(b); added.push(b);
+  }
+  saveCustom();
+  return added;
+}
+export function removeCustomBrush(id: string) { const i = BRUSHES.findIndex((b) => b.id === id && b.group === 'Imported'); if (i >= 0) { BRUSHES.splice(i, 1); saveCustom(); } }
+function saveCustom() { try { localStorage.setItem(CUSTOM_KEY, JSON.stringify(BRUSHES.filter((b) => b.group === 'Imported'))); } catch { /* storage full */ } }
+try {
+  const saved = JSON.parse(localStorage.getItem(CUSTOM_KEY) || '[]');
+  if (Array.isArray(saved)) for (const s of saved) { const b = validateBrush(s); if (b) { b.id = String(s.id).replace(/[^\w-]/g, '') || b.id; b.group = 'Imported'; if (!BRUSHES.some((x) => x.id === b.id)) BRUSHES.push(b); } }
+} catch { /* ignore */ }

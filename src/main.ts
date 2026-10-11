@@ -1,11 +1,12 @@
 import { Engine, Tool, BLEND_MODES, Layer } from './engine';
-import { BRUSHES, Brush, SHAPES, GRAINS, makeShape, ShapeId } from './brushes';
+import { brushFile, parseBrushFile, addCustomBrushes, BRUSHES, Brush, SHAPES, GRAINS, makeShape, ShapeId } from './brushes';
 import { StrokeBuilder, Sample, PressureCurve } from './stroke';
 import { Input, StylusMode } from './input';
 import { pressureSection } from './pressureui';
 import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
 import { AdjustUI } from './adjustui';
+import { openStylusTest } from './stylustest';
 import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
 import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
@@ -67,7 +68,7 @@ const ICON = {
 };
 
 // ------------------------------------------------------------------ persisted state
-interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; selKind?: string; }
+interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; selKind?: string; predict: boolean; wetMedia: boolean; harmony?: string; }
 interface State {
   toolBrush: Record<Tool, string>;
   color: RGB; recent: string[];
@@ -77,9 +78,12 @@ interface State {
 const DEFAULT_STATE: State = {
   toolBrush: { brush: 'ink-studio', eraser: 'air-hard', smudge: 'smudge-soft' },
   color: [0.12, 0.11, 0.1], recent: [],
-  settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true, snapShapes: true, snapDelay: 500 },
+  settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true, snapShapes: true, snapDelay: 500, predict: true, wetMedia: true },
   overrides: {},
 };
+/** colour harmony modes: hue offsets (turns) of the partners */
+const HARMONY: Record<string, number[]> = { off: [], comp: [0.5], analog: [-1 / 12 + 1, 1 / 12], triad: [1 / 3, 2 / 3], split: [5 / 12, 7 / 12], tetrad: [0.25, 0.5, 0.75], shades: [] };
+const HARMONY_LABEL: Record<string, string> = { off: 'Off', comp: 'Complementary', analog: 'Analogous', triad: 'Triadic', split: 'Split', tetrad: 'Tetradic', shades: 'Shades' };
 const prefs = {
   load(): State {
     try { const s = JSON.parse(localStorage.getItem('gesso.v1') || '{}'); return { ...DEFAULT_STATE, ...s, settings: { ...DEFAULT_STATE.settings, ...(s.settings || {}) }, toolBrush: { ...DEFAULT_STATE.toolBrush, ...(s.toolBrush || {}) } }; }
@@ -140,7 +144,8 @@ class App {
       strokeStart: (s, t, er) => this.strokeStart(s, t, er),
       strokeMove: (s) => this.strokeMove(s),
       strokeEnd: () => this.strokeEnd(),
-      strokeCancel: () => { this.engine.cancelStroke(); this.builder = null; },
+      strokeCancel: () => { this.engine.cancelStroke(); this.builder = null; this.clearPrediction(); },
+      strokePredict: (s) => this.strokePredict(s),
       undo: () => this.undo(), redo: () => this.redo(),
       eyedrop: (x, y, done, sx, sy) => this.eyedrop(x, y, done, sx, sy),
       viewChanged: () => { this.engine.needsPresent = true; this.ovDirty = true; },
@@ -162,6 +167,7 @@ class App {
     this.input.stylusMode = this.state.settings.stylus;
     this.curve.set(...this.state.settings.curve);
     this.engine.history.maxSteps = 250;
+    this.engine.wetMedia = this.state.settings.wetMedia !== false;
     this.loupe = h('div', { class: 'loupe' });
     document.body.append(this.loupe);
     this.buildUI();
@@ -355,6 +361,25 @@ class App {
   }
 
   // ---------------------------------------------------------------- brushes
+  /** download the active brush (with the user's tweaks) as a .gessobrush file */
+  exportBrush() {
+    const b = this.brushFor(this.tool);
+    const blob = new Blob([brushFile([b])], { type: 'application/json' });
+    const a = h('a', { href: URL.createObjectURL(blob), download: b.name.replace(/[^\w -]/g, '').trim().replace(/\s+/g, '-') + '.gessobrush' }) as HTMLAnchorElement;
+    a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+    this.toast('Exported ' + b.name);
+  }
+  importBrushes() {
+    const inp = h('input', { type: 'file', accept: '.gessobrush,application/json,.json', multiple: true }) as HTMLInputElement;
+    inp.onchange = async () => {
+      let n = 0;
+      for (const f of [...(inp.files || [])]) {
+        try { n += addCustomBrushes(parseBrushFile(await f.text())).length; } catch (err) { this.toast(f.name + ': ' + (err as Error).message); }
+      }
+      if (n) { this.toast(`Imported ${n} brush${n > 1 ? 'es' : ''}`); if (this.popKind.startsWith('brushes') && this.pop) this.renderBrushes(this.pop); }
+    };
+    inp.click();
+  }
   brushFor(tool: Tool): Brush {
     const id = this.state.toolBrush[tool];
     const base = BRUSHES.find((b) => b.id === id) || BRUSHES[0];
@@ -421,9 +446,41 @@ class App {
     const dabs: Dab[] = [];
     for (const s of samples) dabs.push(...this.builder.add(s));
     this.engine.addDabs(this.expand(dabs));
+    if (dabs.length) this.lastDab = dabs[dabs.length - 1];
+    this.lastRaw = last;
     if (this.strokeTool !== 'smudge' && this.state.settings.snapShapes) { const sp = this.engine.docToScreen(last.x, last.y); this.shapes.pen(sp.x, sp.y); }
   }
+  // ---------------------------------------------------------------- predicted tip
+  // A provisional tip on the overlay: from the last dab actually drawn, through the pen's latest raw position
+  // (closing the gap smoothing leaves) to the browser's predicted positions. Replaced every move, gone on lift.
+  pred: Sample[] | null = null;
+  lastDab: Dab | null = null;
+  lastRaw: Sample | null = null;
+  predStats = { moves: 0, withPrediction: 0, aheadPx: 0 };
+  strokePredict(s: Sample[]) {
+    const st = this.state.settings;
+    this.predStats.moves++;
+    if (!st.predict || !this.builder || this.strokeTool !== 'brush' || this.shapes.phase === 'hold' || this.sym.mode !== 'off' && this.sym.assist) { if (this.pred) this.clearPrediction(); return; }
+    if (s.length) { this.predStats.withPrediction++; const a = this.lastRaw, b = s[s.length - 1]; if (a) this.predStats.aheadPx += Math.hypot(b.x - a.x, b.y - a.y) * this.engine.view.scale; }
+    this.pred = s; this.ovDirty = true;
+  }
+  clearPrediction() { if (this.pred || this.lastDab) { this.pred = null; this.lastDab = null; this.lastRaw = null; this.ovDirty = true; } }
+  drawPrediction(g: CanvasRenderingContext2D) {
+    if (!this.pred || !this.lastDab || !this.lastRaw || !this.strokeBrush) return;
+    const e = this.engine, b = this.strokeBrush;
+    const pts = [this.lastDab, this.lastRaw, ...this.pred].map((p) => e.docToScreen(p.x, p.y));
+    const p = this.lastRaw.p || 1, k = b.minSize + (1 - b.minSize) * (1 - b.pressSize + b.pressSize * Math.max(0.05, p));
+    g.save();
+    g.lineCap = 'round'; g.lineJoin = 'round';
+    g.lineWidth = Math.max(1, Math.max(1, this.lastDab.r * 2) * e.view.scale * 0.9 || b.size * k * e.view.scale);
+    const [r, gg, bb] = this.state.color.map((v) => Math.round(v * 255));
+    g.strokeStyle = `rgba(${r},${gg},${bb},${Math.min(1, b.opacity * Math.max(0.35, b.flow * 2))})`;
+    g.beginPath(); g.moveTo(pts[0].x, pts[0].y); for (const q of pts.slice(1)) g.lineTo(q.x, q.y); g.stroke();
+    g.restore();
+  }
+
   strokeEnd() {
+    this.clearPrediction();
     if (this.capture) { const k = this.capture.kind; this.capture = null; if (k === 'shape') this.shapes.endDrag(); return; }
     if (this.shapes.phase === 'hold') { this.shapes.holdEnd(); this.builder = null; return; }
     this.shapes.strokeEnded();
@@ -607,6 +664,7 @@ class App {
     this.xform?.drawOverlay(g);
     this.selTool?.drawOverlay(g);
     this.adj?.drawOverlay(g);
+    this.drawPrediction(g);
   }
 
   undo() {
@@ -789,6 +847,8 @@ class App {
     let group = cur.group;
     if (!groups.includes(group)) group = groups[0];
     const head = h('div', { class: 'pop-head' }, h('b', {}, tool === 'brush' ? 'Brushes' : tool === 'smudge' ? 'Smudge with' : 'Erase with'),
+      h('button', { class: 'chip small', title: 'Import .gessobrush', onClick: () => this.importBrushes() }, 'Import'),
+      h('button', { class: 'chip small', title: 'Export this brush with your settings', onClick: () => this.exportBrush() }, 'Export'),
       h('button', { class: 'chip', onClick: () => this.openStudio() }, svg(ICON.sliders), 'Brush studio'));
     const side = h('div', { class: 'groups' });
     const list = h('div', { class: 'blist' });
@@ -824,8 +884,8 @@ class App {
     const sec = (title: string) => { const s = h('section', {}, h('h4', {}, title)); body.append(s); return s; };
     const slider = (parent: HTMLElement, label: string, key: keyof Brush, min: number, max: number, step: number, fmt: (v: number) => string = (v) => String(Math.round(v * 100) / 100)) => {
       const b = this.brushFor(this.tool);
-      const val = h('span', { class: 'sv' }, fmt(b[key] as number));
-      const inp = h('input', { type: 'range', min, max, step, value: b[key] as number }) as HTMLInputElement;
+      const val = h('span', { class: 'sv' }, fmt((b[key] as number) ?? 0));
+      const inp = h('input', { type: 'range', min, max, step, value: (b[key] as number) ?? 0 }) as HTMLInputElement;
       inp.oninput = () => { this.setBrushProp(key, +inp.value as never); val.textContent = fmt(+inp.value); redraw(); this.syncSliders(); };
       parent.append(h('label', { class: 'srow' }, h('span', {}, label), inp, val));
     };
@@ -877,6 +937,8 @@ class App {
     slider(s, 'Tilt shading', 'tiltSize', 0, 3, 0.05, (v) => v.toFixed(2));
     s = sec('Wet paint');
     slider(s, 'Wet edges', 'wetEdges', 0, 1, 0.01, pct);
+    slider(s, 'Drying flow (watercolour)', 'wet' as keyof Brush, 0, 1, 0.01, pct);
+    slider(s, 'Granulation', 'granulation' as keyof Brush, 0, 1, 0.01, pct);
     s.append(h('button', { class: 'btn ghost', onClick: () => { delete this.state.overrides[b0.id]; this.save(); this.syncSliders(); sheet.close(); this.openStudio(); } }, 'Reset brush to default'));
     sheet.body.append(preview, body);
     redraw();
@@ -893,7 +955,7 @@ class App {
     const hex = toHex(this.state.color);
     const r = this.state.recent.filter((x) => x !== hex);
     r.unshift(hex);
-    this.state.recent = r.slice(0, 12);
+    this.state.recent = r.slice(0, 18);
     this.save();
   }
   updateColorButton() { $('#bColor').style.background = toHex(this.state.color); }
@@ -935,6 +997,12 @@ class App {
       // markers
       const a = hsv.h * 2 * Math.PI - Math.PI / 2, rm = (R + ringIn) / 2;
       const mark = (x: number, y: number, fill: string) => { g.beginPath(); g.arc(x, y, 9, 0, 7); g.fillStyle = fill; g.fill(); g.lineWidth = 3; g.strokeStyle = '#fff'; g.stroke(); g.lineWidth = 1; g.strokeStyle = 'rgba(0,0,0,.4)'; g.stroke(); };
+      // harmony partners on the ring
+      for (const o of HARMONY[this.state.settings.harmony || 'off'] || []) {
+        const ha = ((hsv.h + o) % 1) * 2 * Math.PI - Math.PI / 2;
+        g.beginPath(); g.arc(R + Math.cos(ha) * rm, R + Math.sin(ha) * rm, 6, 0, 7); g.fillStyle = toHex(hsvToRgb({ h: (hsv.h + o) % 1, s: 1, v: 1 })); g.fill();
+        g.lineWidth = 2; g.strokeStyle = 'rgba(255,255,255,.85)'; g.stroke();
+      }
       mark(R + Math.cos(a) * rm, R + Math.sin(a) * rm, toHex(base));
       mark(x0 + hsv.s * sq, y0 + (1 - hsv.v) * sq, toHex(hsvToRgb(hsv)));
     };
@@ -945,7 +1013,7 @@ class App {
       if (!mode) mode = Math.hypot(x - R, y - R) >= ringIn - 4 ? 'ring' : 'sq';
       if (mode === 'ring') hsv.h = (Math.atan2(y - R, x - R) / (2 * Math.PI) + 1.25) % 1;
       else { hsv.s = Math.max(0, Math.min(1, (x - (R - sq / 2)) / sq)); hsv.v = Math.max(0, Math.min(1, 1 - (y - (R - sq / 2)) / sq)); }
-      this.state.color = hsvToRgb(hsv); this.updateColorButton(); draw(); cur.style.background = toHex(this.state.color); hex.value = toHex(this.state.color);
+      this.state.color = hsvToRgb(hsv); this.updateColorButton(); draw(); cur.style.background = toHex(this.state.color); hex.value = toHex(this.state.color); fillHarmony();
     };
     cv.addEventListener('pointerdown', (e) => { cv.setPointerCapture(e.pointerId); mode = null; pick(e); });
     cv.addEventListener('pointermove', (e) => { if (cv.hasPointerCapture(e.pointerId)) pick(e); });
@@ -955,10 +1023,28 @@ class App {
     const hex = h('input', { class: 'hex', value: old, maxlength: 7, spellcheck: false }) as HTMLInputElement;
     hex.onchange = () => { const c = fromHex(hex.value); if (c) this.setColor(c); };
     const sw = (list: string[], cls: string) => h('div', { class: cls }, ...list.map((c) => h('button', { class: 'sw', style: `background:${c}`, title: c, onClick: () => this.setColor(fromHex(c)!) })));
+    // colour harmony: partners of the current colour (same saturation and brightness, related hues)
+    const harmSw = h('div', { class: 'swatches harm' });
+    const fillHarmony = () => {
+      harmSw.innerHTML = '';
+      const offs = HARMONY[this.state.settings.harmony || 'off'] || [];
+      for (const o of [0, ...offs]) {
+        const c = toHex(hsvToRgb({ h: (hsv.h + o) % 1, s: hsv.s, v: hsv.v }));
+        harmSw.append(h('button', { class: 'sw' + (o === 0 ? ' base' : ''), style: `background:${c}`, title: c, onClick: () => this.setColor(fromHex(c)!) }));
+      }
+      // tints and shades of the current hue for value studies
+      if (this.state.settings.harmony === 'shades') { harmSw.innerHTML = ''; for (const v of [0.15, 0.3, 0.45, 0.6, 0.75, 0.9]) { const c = toHex(hsvToRgb({ h: hsv.h, s: hsv.s, v })); harmSw.append(h('button', { class: 'sw', style: `background:${c}`, title: c, onClick: () => this.setColor(fromHex(c)!) })); } }
+    };
+    const harmChips = h('div', { class: 'chips harm-modes' }, ...Object.entries(HARMONY_LABEL).map(([k, label]) => h('button', {
+      class: 'chip small' + ((this.state.settings.harmony || 'off') === k ? ' on' : ''),
+      onClick: () => { this.state.settings.harmony = k; this.save(); this.renderColor(el); } }, label)));
+    fillHarmony();
     el.append(...[
       h('div', { class: 'pop-head' }, h('b', {}, 'Colour'), h('div', { class: 'cpair' }, prev, cur), hex),
       cv,
-      this.state.recent.length ? h('div', { class: 'lbl' }, 'Recent') : null,
+      h('div', { class: 'lbl' }, 'Harmony'), harmChips,
+      (this.state.settings.harmony || 'off') !== 'off' ? harmSw : null,
+      this.state.recent.length ? h('div', { class: 'lbl' }, 'History · colours you painted with') : null,
       this.state.recent.length ? sw(this.state.recent, 'swatches') : null,
       h('div', { class: 'lbl' }, 'Palette'),
       sw(PALETTE, 'swatches'),
@@ -1180,9 +1266,21 @@ class App {
           h('label', { class: 'srow' }, h('span', {}, 'Hold time'), d, dv),
           h('p', { class: 'muted' }, 'Lines, arcs, polylines, ellipses, circles, rectangles and polygons. Keep holding and move to resize; touch the screen with a finger for a perfect circle, square or 15° line.'));
       })(),
+      (() => {
+        const pr = h('input', { type: 'checkbox' }) as HTMLInputElement; pr.checked = st.predict;
+        pr.onchange = () => { st.predict = pr.checked; this.save(); };
+        const wm = h('input', { type: 'checkbox' }) as HTMLInputElement; wm.checked = st.wetMedia;
+        wm.onchange = () => { st.wetMedia = wm.checked; this.engine.wetMedia = wm.checked; this.save(); };
+        return h('section', {}, h('h4', {}, 'Brush feel'),
+          h('label', { class: 'srow' }, h('span', {}, 'Predicted tip — draw slightly ahead of the pen to hide display latency'), pr),
+          h('label', { class: 'srow' }, h('span', {}, 'Watercolour dries on the paper (pigment flows to the edges and settles in the grain)'), wm),
+          h('div', { class: 'chips' }, h('button', { class: 'chip', onClick: () => { s.close(); this.openStylusTest(); } }, 'Stylus & palm test…')));
+      })(),
       h('section', {}, h('h4', {}, 'Layout'), h('label', { class: 'srow' }, h('span', {}, 'Sidebar on the right'), rail)),
     );
   }
+
+  openStylusTest() { this.closePop(); return openStylusTest(); }
 
   showHelp() {
     const s = this.sheet('Gestures');
@@ -1337,4 +1435,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 (window as any).gesso = new App();
-(window as any).gessoTest = { loadClip, exportClip, selectFrames, homography, exportAnimation, GifSession, buildPalette };
+(window as any).gessoTest = { brushes: { brushFile, parseBrushFile, addCustomBrushes, BRUSHES }, loadClip, exportClip, selectFrames, homography, exportAnimation, GifSession, buildPalette };
