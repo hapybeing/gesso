@@ -41,6 +41,7 @@ export class Program {
     return this;
   }
   i(name: string, v: number) { this.gl.uniform1i(this.u(name), v); return this; }
+  i2(name: string, a: number, b: number) { this.gl.uniform2i(this.u(name), a, b); return this; }
   m3(name: string, m: Float32Array | number[]) { this.gl.uniformMatrix3fv(this.u(name), false, m); return this; }
   tex(name: string, unit: number, t: WebGLTexture | null) {
     const gl = this.gl;

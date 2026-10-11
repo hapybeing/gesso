@@ -1095,7 +1095,7 @@ class App {
     const w = h('input', { type: 'number', value: 2048, min: 16, max: this.engine.maxTex }) as HTMLInputElement;
     const hh = h('input', { type: 'number', value: 2048, min: 16, max: this.engine.maxTex }) as HTMLInputElement;
     const info = h('div', { class: 'muted' });
-    const upd = () => { info.textContent = `Up to ${this.engine.maxLayersFor(+w.value || 1, +hh.value || 1)} layers at this size · max side ${this.engine.maxTex}px`; };
+    const upd = () => { info.textContent = `Layers and frames use memory only where painted · max side ${this.engine.maxTex}px`; };
     w.oninput = hh.oninput = upd; upd();
     const go = (W: number, H: number) => {
       s.close(); this.newCanvas(W, H);

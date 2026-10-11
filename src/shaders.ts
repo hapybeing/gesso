@@ -94,16 +94,17 @@ uniform int uMode; uniform float uOpacity;
 uniform int uClipMode; // 0 none, 1 clip, 2 clip with live-stroked base
 uniform int uActive;
 uniform vec4 uTint; // rgb + amount (onion skins)
+uniform vec4 uLayerMap, uClipMap; // doc uv -> layer/clip texture uv (identity, or a tile's place in an atlas page)
 ${STROKE_CHUNK}
 ${BLEND_CHUNK}
 void main(){
   vec4 b = texture(uPrev, vUv);
-  vec4 s = texture(uLayer, vUv);
+  vec4 s = texture(uLayer, vUv * uLayerMap.xy + uLayerMap.zw);
   if (uActive == 1) s = applyStroke(s, vUv);
   s.rgb = mix(s.rgb, uTint.rgb * s.a, uTint.a);
   s *= uOpacity;
   if (uClipMode > 0) {
-    vec4 c = texture(uClip, vUv);
+    vec4 c = texture(uClip, vUv * uClipMap.xy + uClipMap.zw);
     if (uClipMode == 2) c = applyStroke(c, vUv);
     s *= c.a;
   }

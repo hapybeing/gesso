@@ -13,6 +13,8 @@ export interface DocMeta {
   modified: number;
   /** extra per-document state (symmetry guide etc.) */
   extra?: Record<string, unknown>;
+  /** 'tiles': pixels stored as 256 px tiles (docId/uid/index); absent: one blob per layer (before M4) */
+  storage?: 'tiles';
 }
 
 /** a batch of recorded time-lapse frames (one encoder segment can span many packs) */
@@ -24,7 +26,7 @@ export interface TlPack {
   frames: { key: boolean; data: ArrayBuffer; area: number }[];
 }
 
-const DB = 'gesso', VER = 2;
+const DB = 'gesso', VER = 3;
 let dbp: Promise<IDBDatabase> | null = null;
 function db(): Promise<IDBDatabase> {
   if (!dbp) dbp = new Promise((res, rej) => {
@@ -34,6 +36,7 @@ function db(): Promise<IDBDatabase> {
       if (!d.objectStoreNames.contains('docs')) d.createObjectStore('docs', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('layers')) d.createObjectStore('layers');
       if (!d.objectStoreNames.contains('thumbs')) d.createObjectStore('thumbs');
+      if (!d.objectStoreNames.contains('tiles')) d.createObjectStore('tiles'); // docId/uid/tileIndex -> deflated RGBA
       if (!d.objectStoreNames.contains('tl')) d.createObjectStore('tl'); // time-lapse packs: docId/seq
     };
     r.onsuccess = () => res(r.result);
@@ -61,6 +64,34 @@ export const store = {
   putMeta: (m: DocMeta) => tx(['docs'], 'readwrite', (t) => req(t.objectStore('docs').put(m))).then(() => {}),
   putLayer: (docId: string, uid: string, blob: Blob) => tx(['layers'], 'readwrite', (t) => req(t.objectStore('layers').put(blob, docId + '/' + uid))).then(() => {}),
   getLayer: (docId: string, uid: string) => tx(['layers'], 'readonly', (t) => req(t.objectStore('layers').get(docId + '/' + uid) as IDBRequest<Blob | undefined>)),
+  /** write and delete tiles of one layer in a single transaction */
+  putTiles: (docId: string, uid: string, puts: [number, Blob][], dels: number[]) => tx(['tiles'], 'readwrite', (t) => {
+    const os = t.objectStore('tiles'), k = docId + '/' + uid + '/';
+    for (const [i, b] of puts) os.put(b, k + i);
+    for (const i of dels) os.delete(k + i);
+  }).then(() => {}),
+  /** every stored tile of a document, grouped by layer uid */
+  async getTiles(docId: string): Promise<Map<string, Map<number, Blob>>> {
+    const out = new Map<string, Map<number, Blob>>();
+    await tx(['tiles'], 'readonly', async (t) => {
+      const os = t.objectStore('tiles');
+      const [keys, vals] = await Promise.all([req(os.getAllKeys(range(docId))), req(os.getAll(range(docId)) as IDBRequest<Blob[]>)]);
+      keys.forEach((k, j) => {
+        const [, uid, idx] = String(k).split('/');
+        let m = out.get(uid); if (!m) out.set(uid, (m = new Map()));
+        m.set(+idx, vals[j]);
+      });
+    });
+    return out;
+  },
+  /** remove tiles of layers that are not in keep */
+  async pruneTiles(docId: string, keep: Set<string>) {
+    await tx(['tiles'], 'readwrite', async (t) => {
+      const os = t.objectStore('tiles');
+      const keys = await req(os.getAllKeys(range(docId)));
+      for (const k of keys) if (!keep.has(String(k).split('/')[1])) os.delete(k);
+    });
+  },
   putThumb: (docId: string, blob: Blob) => tx(['thumbs'], 'readwrite', (t) => req(t.objectStore('thumbs').put(blob, docId))).then(() => {}),
   getThumb: (docId: string) => tx(['thumbs'], 'readonly', (t) => req(t.objectStore('thumbs').get(docId) as IDBRequest<Blob | undefined>)),
   /** remove layer blobs of a document that are not in keep */
@@ -85,7 +116,8 @@ export const store = {
   },
   clearTl: (docId: string) => tx(['tl'], 'readwrite', (t) => req(t.objectStore('tl').delete(range(docId)))).then(() => {}),
   async remove(docId: string) {
-    await tx(['docs', 'layers', 'thumbs', 'tl'], 'readwrite', (t) => {
+    await tx(['docs', 'layers', 'tiles', 'thumbs', 'tl'], 'readwrite', (t) => {
+      t.objectStore('tiles').delete(range(docId));
       t.objectStore('tl').delete(range(docId));
       t.objectStore('docs').delete(docId);
       t.objectStore('layers').delete(range(docId));
@@ -97,7 +129,11 @@ export const store = {
     if (!m) return null;
     const now = Date.now();
     const copy: DocMeta = { ...structuredClone(m), id: newId, name, created: now, modified: now };
-    await tx(['docs', 'layers', 'thumbs', 'tl'], 'readwrite', async (t) => {
+    await tx(['docs', 'layers', 'tiles', 'thumbs', 'tl'], 'readwrite', async (t) => {
+      const ts = t.objectStore('tiles');
+      const tik = await req(ts.getAllKeys(range(docId)));
+      const tiv = await req(ts.getAll(range(docId)));
+      tik.forEach((k, i) => ts.put(tiv[i], newId + String(k).slice(docId.length)));
       const tl = t.objectStore('tl');
       const tk = await req(tl.getAllKeys(range(docId)));
       const tv = await req(tl.getAll(range(docId)));

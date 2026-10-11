@@ -2,6 +2,7 @@ import { GL, Program, Target, makeTarget, freeTarget, bindTarget, textureFromCan
 import * as S from './shaders';
 import { Brush, ShapeId, GrainId, makeShape, makeGrain } from './brushes';
 import { History, Entry } from './history';
+import { TilePool, TiledLayer, TileRef, TILE } from './tiles';
 
 export const BLEND_MODES = ['Normal', 'Multiply', 'Screen', 'Overlay', 'Darken', 'Lighten', 'Colour Dodge', 'Colour Burn',
   'Hard Light', 'Soft Light', 'Difference', 'Exclusion', 'Add', 'Linear Burn', 'Hue', 'Saturation', 'Colour', 'Luminosity'];
@@ -12,7 +13,9 @@ export interface Dab { x: number; y: number; r: number; a: number; angle: number
 let layerSeq = 1;
 const newUid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 export interface LayerProps { uid: string; name: string; visible: boolean; opacity: number; blend: number; alphaLock: boolean; clip: boolean; }
-export class Layer {
+export class Layer implements TiledLayer {
+  /** set by the engine: where every layer's pixels live */
+  static pool: TilePool;
   id = layerSeq++;
   /** stable identity across sessions (storage key) */
   uid = newUid();
@@ -22,7 +25,17 @@ export class Layer {
   alphaLock = false;
   clip = false;
   version = 0;
-  constructor(public name: string, public target: Target) {}
+  // storage (see tiles.ts): sparse atlas tiles, plus a full working texture while the layer is being edited
+  res: Target | null = null;
+  tiles = new Map<number, TileRef>();
+  tilesVersion = -1;
+  lastUse = 0;
+  /** a new layer: empty (no memory at all) unless given a full-size texture to adopt */
+  constructor(public name: string, t?: Target | null) { if (t) Layer.pool.adopt(this, t); }
+  /** full-size texture of the layer's pixels; makes the layer resident (cheap when it already is) */
+  get target(): Target { return Layer.pool.materialise(this); }
+  /** replace the pixels with this texture (the previous resident texture now belongs to the caller) */
+  set target(t: Target) { Layer.pool.adopt(this, t); }
   props(): LayerProps { return { uid: this.uid, name: this.name, visible: this.visible, opacity: this.opacity, blend: this.blend, alphaLock: this.alphaLock, clip: this.clip }; }
 }
 
@@ -139,6 +152,9 @@ export class Engine {
   // view: doc px -> screen css px
   view = { x: 0, y: 0, scale: 1, rot: 0 };
 
+  pool!: TilePool;
+  /** layers that must stay resident besides the active one (tools in progress) */
+  keepResident = new Set<Layer>();
   constructor(public canvas: HTMLCanvasElement) {
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, premultipliedAlpha: true, preserveDrawingBuffer: false, desynchronized: true, powerPreference: 'high-performance' } as WebGLContextAttributes);
     if (!gl) throw new Error('WebGL2 is not available on this device/browser.');
@@ -146,6 +162,8 @@ export class Engine {
     this.strokeFloat = !!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float');
     this.maxTex = Math.min(gl.getParameter(gl.MAX_TEXTURE_SIZE), 8192);
     this.initGL();
+    this.pool = new TilePool(gl, () => this.drawQuad(), () => ({ w: this.w, h: this.h }));
+    Layer.pool = this.pool;
   }
 
   private initGL() {
@@ -209,16 +227,28 @@ export class Engine {
   }
 
   /** rough maximum number of layers given a GPU memory budget */
-  maxLayersFor(w: number, h: number) {
-    const budget = 560 * 1024 * 1024;
-    const fixed = w * h * (4 * 3 + (this.strokeFloat ? 2 : 4));
-    return Math.max(4, Math.min(64, Math.floor((budget - fixed) / (w * h * 4))));
+  /** GPU memory allowed for layer pixels (atlas tiles + resident layers) */
+  layerBudget = 560 * 1024 * 1024;
+  /** layer cap: with sparse tiles an empty layer costs nothing, so the real limit is memory (see canGrow) */
+  maxLayersFor(w: number, h: number) { return this.canGrow() ? 999 : this.layers.length; }
+  /** is there room for more painted pixels? (fixed buffers + tiles + resident layers within the budget) */
+  canGrow() {
+    const fixed = this.w * this.h * (4 * 3 + (this.strokeFloat ? 2 : 4));
+    // resident layers are transient (evicted when idle, at most pool.maxResident): count two working layers
+    return fixed + this.pool.atlasBytes + 2 * this.w * this.h * 4 < this.layerBudget;
+  }
+  /** memory report for the gallery/settings and tests */
+  memoryStats() {
+    const fixed = this.w * this.h * (4 * 4 + (this.strokeFloat ? 2 : 4));
+    return { tiles: this.pool.tileCount, pages: this.pool.pages.filter(Boolean).length, resident: this.pool.residentCount, layerBytes: this.pool.bytes, fixedBytes: fixed,
+      wholeLayerBytes: this.layers.length * this.w * this.h * 4 };
   }
 
   newDocument(w: number, h: number, bg: [number, number, number] = [1, 1, 1]) {
     const gl = this.gl;
-    for (const l of this.layers) freeTarget(gl, l.target);
     this.history.clear();
+    for (const l of this.layers) this.pool.releaseLayer(l);
+    this.pool.dispose();
     for (const t of [this.stroke, this.comp, this.s1, this.s2, this.snapshot]) if (t) freeTarget(gl, t);
     this.snapshot = null;
     if (this.sel) { freeTarget(gl, this.sel); this.sel = null; }
@@ -228,7 +258,7 @@ export class Engine {
       : makeTarget(gl, w, h);
     this.comp = makeTarget(gl, w, h);
     this.s1 = makeTarget(gl, w, h); this.s2 = makeTarget(gl, w, h);
-    this.layers = [new Layer('Layer 1', makeTarget(gl, w, h))];
+    this.layers = [new Layer('Layer 1')];
     this.active = 0;
     this.warmup();
     this.markDirty();
@@ -299,16 +329,38 @@ export class Engine {
     const p = this.pComposite.use();
     this.setStrokeUniforms(p, null);
     const items = this.drawItems();
+    const pool = this.pool;
+    type Region = { x: number; y: number; w: number; h: number; lr?: TileRef; cr?: TileRef };
     for (const it of items) {
       const l = it.layer, clipBase = it.clipBase;
+      // resident layers draw in one pass; tiled ones only where they (and their clipping base) have tiles
+      const lt = l.res ? null : l.tiles, ct = clipBase && !clipBase.res ? clipBase.tiles : null;
+      let regions: Region[] | null = null;
+      if (lt || ct) {
+        regions = [];
+        const src2 = lt ?? ct!;
+        for (const [i, ref] of src2) {
+          const tr = pool.tileRect(i);
+          const x = Math.max(tr.x, r.x), y = Math.max(tr.y, r.y), x2 = Math.min(tr.x + tr.w, r.x + r.w), y2 = Math.min(tr.y + tr.h, r.y + r.h);
+          if (x2 <= x || y2 <= y) continue;
+          const lr = lt ? ref : undefined, cr = ct ? (lt ? ct.get(i) : ref) : undefined;
+          if (ct && !cr) continue;
+          regions.push({ x, y, w: x2 - x, h: y2 - y, lr, cr });
+        }
+        if (!regions.length) continue;   // nothing of this layer here: no pass at all
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb);
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fb);
+        gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, r.x, r.y, r.x + r.w, r.y + r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      }
       bindTarget(gl, dst);
       this.setStrokeUniforms(p, l);
       p.i('uActive', this.cur && this.cur.layer === l ? 1 : 0);
-      p.tex('uPrev', 0, src.tex).tex('uLayer', 1, l.target.tex);
+      p.tex('uPrev', 0, src.tex);
+      if (l.res) p.tex('uLayer', 1, l.res.tex).f('uLayerMap', 1, 1, 0, 0);
       p.i('uMode', it.blend ?? l.blend).f('uOpacity', it.opacity);
       const t = it.tint; p.f('uTint', t ? t[0] : 0, t ? t[1] : 0, t ? t[2] : 0, t ? t[3] : 0);
       if (clipBase) {
-        p.tex('uClip', 2, clipBase.target.tex);
+        if (clipBase.res) p.tex('uClip', 2, clipBase.res.tex).f('uClipMap', 1, 1, 0, 0);
         p.i('uClipMode', this.cur && this.cur.layer === clipBase && this.cur.tool !== 'smudge' ? 2 : 1);
         if (this.cur && this.cur.layer === clipBase && this.cur.layer !== l) {
           // the shared stroke uniforms belong to the base when the base is being painted
@@ -316,7 +368,18 @@ export class Engine {
           p.i('uActive', 0);
         }
       } else { p.i('uClipMode', 0); p.tex('uClip', 2, null); }
-      this.drawQuad();
+      if (!regions) this.drawQuad();
+      else {
+        const P = pool.page, W = this.w, H = this.h;
+        for (const g of regions) {
+          gl.scissor(g.x, g.y, g.w, g.h);
+          const ti = Math.floor(g.x / TILE), tj = Math.floor(g.y / TILE);
+          if (g.lr) { const s = pool.slotXY(g.lr); p.tex('uLayer', 1, pool.pageTex(g.lr)).f('uLayerMap', W / P, H / P, (s.x - ti * TILE) / P, (s.y - tj * TILE) / P); }
+          if (g.cr) { const s = pool.slotXY(g.cr); p.tex('uClip', 2, pool.pageTex(g.cr)).f('uClipMap', W / P, H / P, (s.x - ti * TILE) / P, (s.y - tj * TILE) / P); }
+          this.drawQuad();
+        }
+        gl.scissor(r.x, r.y, r.w, r.h);
+      }
       const tt = src; src = dst; dst = tt;
     }
     this.stats.compositePx += r.w * r.h * Math.max(1, items.length);
@@ -378,10 +441,15 @@ export class Engine {
     }
   }
 
+  private maintainTiles() {
+    const keep = new Set<Layer>(this.keepResident);
+    if (this.activeLayer) keep.add(this.activeLayer);
+    this.pool.maintain(keep);
+  }
   render() {
     const gl = this.gl;
     if (!this.comp) return; // no document yet (boot is still reading storage)
-    if (!this.cur) this.maintainStashes();
+    if (!this.cur) { this.maintainStashes(); this.maintainTiles(); }
     if (this.dirty) {
       this.composite(this.dirty);
       this.dirty = null;
@@ -423,6 +491,7 @@ export class Engine {
     if (this.cur) this.cancelStroke();
     const layer = this.activeLayer;
     if (!layer) return false;
+    void layer.target;   // resident while painted
     this.cur = { layer, tool, brush, color, bbox: null, dabs: [], smudgeInit: false };
     const gl = this.gl;
     if (tool === 'smudge') {
@@ -688,7 +757,8 @@ export class Engine {
     bindTarget(gl, this.thumbT);
     gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
+    this.pDown.use().tex('uSrc', 0, this.pool.readable(layer).tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
+    bindTarget(gl, this.thumbT);
     this.drawQuad();
     const px = this.readRect(this.thumbT, { x: 0, y: 0, w: tw, h: th });
     const img = new ImageData(tw, th);
@@ -705,8 +775,9 @@ export class Engine {
     const gl = this.gl, tw = out.width, th = out.height;
     const t = makeTarget(gl, tw, th);
     const scale = Math.max(this.w / tw, this.h / th);
+    const srcT = this.pool.readable(layer);
     bindTarget(gl, t); gl.disable(gl.BLEND);
-    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
+    this.pDown.use().tex('uSrc', 0, srcT.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0).i('uTaps', 4);
     this.drawQuad();
     const rb = new Readback(gl, t.fb, 0, 0, tw, th);
     freeTarget(gl, t); // the copy into the pack buffer is already queued
@@ -736,13 +807,13 @@ export class Engine {
       label, bytes: this.bytesPerLayer(),
       undo: () => { this.layers.splice(this.layers.indexOf(layer), 1); this.active = Math.min(prevActive, this.layers.length - 1); this.changed(); },
       redo: doIt,
-      dispose: (done) => { if (!done) freeTarget(this.gl, layer.target); },
+      dispose: (done) => { if (!done) this.pool.releaseLayer(layer); },
     });
   }
 
   addLayer(): Layer | null {
     if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
-    const l = new Layer('Layer ' + (Math.max(0, ...this.layers.map((x) => +(x.name.match(/^Layer (\d+)$/)?.[1] ?? 0))) + 1), this.newTarget());
+    const l = new Layer('Layer ' + (Math.max(0, ...this.layers.map((x) => +(x.name.match(/^Layer (\d+)$/)?.[1] ?? 0))) + 1));
     this.insertLayer(l, this.active + 1, 'New layer');
     return l;
   }
@@ -765,7 +836,7 @@ export class Engine {
       label: 'Delete layer', bytes: this.bytesPerLayer(),
       undo: () => { this.layers.splice(idx, 0, layer); this.active = idx; this.changed(); },
       redo: doIt,
-      dispose: (done) => { if (done) freeTarget(this.gl, layer.target); },
+      dispose: (done) => { if (done) this.pool.releaseLayer(layer); },
     });
     return true;
   }
@@ -1003,6 +1074,7 @@ export class Engine {
       bindTarget(gl, tmp);
       gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
       const p = this.pComposite.use(); this.setStrokeUniforms(p, null);
+      p.f('uLayerMap', 1, 1, 0, 0).f('uClipMap', 1, 1, 0, 0).f('uTint', 0, 0, 0, 0);
       p.tex('uPrev', 0, null).tex('uLayer', 1, upper.target.tex).tex('uClip', 2, lower.target.tex)
         .i('uMode', 0).f('uOpacity', 1).i('uClipMode', 1).i('uActive', 0);
       // uPrev null samples (0,0,0,0) on most drivers; bind cleared s1 to be safe
@@ -1015,14 +1087,16 @@ export class Engine {
     const p = this.pMerge.use();
     p.tex('uPrev', 0, lower.target.tex).tex('uLayer', 1, src).i('uMode', upper.blend).f('uOpacity', upper.opacity * (upper.visible ? 1 : 0));
     this.drawQuad();
-    const old = lower.target;
-    const doIt = () => { lower.target = t; this.layers.splice(this.layers.indexOf(upper), 1); this.active = this.layers.indexOf(lower); lower.version++; this.changed(); };
-    doIt();
+    // swap semantics (the entry holds the pixels of the state it is not in) so no texture is ever owned twice
+    let held = new Stash(gl, lower.target, this.stashes);
+    lower.target = t;
+    const swapLower = () => { const cur = new Stash(gl, lower.target, this.stashes); lower.target = held.take(); held = cur; lower.version++; };
+    this.layers.splice(this.layers.indexOf(upper), 1); this.active = this.layers.indexOf(lower); lower.version++; this.changed();
     this.history.push({
       label: 'Merge down', bytes: this.bytesPerLayer() * 2,
-      undo: () => { lower.target = old; this.layers.splice(this.layers.indexOf(lower) + 1, 0, upper); this.active = this.layers.indexOf(upper); lower.version++; this.changed(); },
-      redo: doIt,
-      dispose: (done) => { if (done) { freeTarget(gl, old); freeTarget(gl, upper.target); } else freeTarget(gl, t); },
+      undo: () => { swapLower(); this.layers.splice(this.layers.indexOf(lower) + 1, 0, upper); this.active = this.layers.indexOf(upper); this.changed(); },
+      redo: () => { swapLower(); this.layers.splice(this.layers.indexOf(upper), 1); this.active = this.layers.indexOf(lower); this.changed(); },
+      dispose: (done) => { held.dispose(); if (done) this.pool.releaseLayer(upper); },
     });
     return true;
   }
@@ -1073,18 +1147,45 @@ export class Engine {
   }
 
   // ---------------------------------------------------------------- persistence
+  /** split full-layer pixels (GL row order) into the layer's tiles, skipping empty ones */
+  private writeTilesFromFull(l: Layer, data: Uint8Array) {
+    const pool = this.pool, n = pool.tilesX * pool.tilesY, w = this.w;
+    for (let i = 0; i < n; i++) {
+      const r = pool.tileRect(i);
+      const t = new Uint8Array(r.w * r.h * 4);
+      let any = false;
+      for (let y = 0; y < r.h; y++) {
+        const o = ((r.y + y) * w + r.x) * 4;
+        const row = data.subarray(o, o + r.w * 4);
+        if (!any) { const u = new Uint32Array(row.buffer, row.byteOffset, r.w); for (let x = 0; x < r.w; x++) if (u[x]) { any = true; break; } }
+        t.set(row, y * r.w * 4);
+      }
+      if (any) pool.writeTile(l, i, t);
+    }
+  }
+  /** a layer's non-empty tiles (index → premultiplied RGBA of the clipped tile), read asynchronously */
+  readLayerTiles(layer: Layer) { return this.pool.readTiles(layer); }
   /** full layer pixels (premultiplied RGBA, GL row order) without stalling the pipeline */
   readLayerAsync(layer: Layer): Promise<Uint8Array> {
-    return new Readback(this.gl, layer.target.fb, 0, 0, this.w, this.h).wait();
+    return new Readback(this.gl, this.pool.readable(layer).fb, 0, 0, this.w, this.h).wait();
   }
 
   /** replace the whole document (no undo history) */
   loadDocument(w: number, h: number, bg: [number, number, number], bgVisible: boolean,
-    layers: { props: LayerProps; data?: Uint8Array | null; image?: ImageBitmap; x?: number; y?: number }[], active: number) {
+    layers: { props: LayerProps; data?: Uint8Array | null; tiles?: Map<number, Uint8Array> | null; image?: ImageBitmap; x?: number; y?: number }[], active: number) {
     this.newDocument(w, h, bg);
     const gl = this.gl;
-    freeTarget(gl, this.layers[0].target);
-    this.layers = layers.map(({ props, data, image, x = 0, y = 0 }) => {
+    this.pool.releaseLayer(this.layers[0]);
+    this.layers = layers.map(({ props, data, image, tiles, x = 0, y = 0 }) => {
+      if (tiles || (data && data.byteLength === w * h * 4)) {
+        // straight into atlas tiles: opening a long animation never needs a full texture per frame
+        const l = new Layer(props.name);
+        if (tiles) for (const [i, d] of tiles) this.pool.writeTile(l, i, d);
+        else this.writeTilesFromFull(l, data!);
+        l.tilesVersion = l.version;
+        Object.assign(l, { uid: props.uid || l.uid, visible: props.visible, opacity: props.opacity, blend: props.blend, alphaLock: props.alphaLock, clip: props.clip });
+        return l;
+      }
       const t = makeTarget(gl, w, h);
       if (image) {
         // straight-alpha image -> premultiplied layer, placed at its offset
@@ -1104,7 +1205,7 @@ export class Engine {
       Object.assign(l, { uid: props.uid || l.uid, visible: props.visible, opacity: props.opacity, blend: props.blend, alphaLock: props.alphaLock, clip: props.clip });
       return l;
     });
-    if (!this.layers.length) this.layers = [new Layer('Layer 1', makeTarget(gl, w, h))];
+    if (!this.layers.length) this.layers = [new Layer('Layer 1')];
     this.bgVisible = bgVisible;
     this.active = Math.max(0, Math.min(this.layers.length - 1, active));
     this.markDirty();
@@ -1294,14 +1395,14 @@ export class Engine {
   /** add a layer above the active one without recording history (a pending transform) */
   addLayerRaw(name: string): Layer | null {
     if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
-    const l = new Layer(name, this.newTarget());
+    const l = new Layer(name);
     this.layers.splice(this.active + 1, 0, l); this.active++;
     this.changed();
     return l;
   }
   removeLayerRaw(layer: Layer) {
     const i = this.layers.indexOf(layer); if (i < 0) return;
-    this.layers.splice(i, 1); freeTarget(this.gl, layer.target);
+    this.layers.splice(i, 1); this.pool.releaseLayer(layer);
     this.active = Math.max(0, Math.min(this.active, this.layers.length - 1)); this.changed();
   }
   /** record a layer that is already in the stack as an undoable insertion */
@@ -1312,7 +1413,7 @@ export class Engine {
       label, bytes: this.bytesPerLayer(),
       undo: () => { this.layers.splice(this.layers.indexOf(layer), 1); this.active = Math.min(prevActive, this.layers.length - 1); this.changed(); },
       redo: doIt,
-      dispose: (done) => { if (!done) freeTarget(this.gl, layer.target); },
+      dispose: (done) => { if (!done) this.pool.releaseLayer(layer); },
     });
   }
   /** record that a layer's pixels changed from `before` (a full-layer stash) to what it holds now */

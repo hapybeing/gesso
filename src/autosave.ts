@@ -1,5 +1,7 @@
-// Debounced autosave of the open document. Only layers whose pixels changed since the last save are read
-// back (async PBO, no stall) and re-compressed; properties and the thumbnail are cheap and always written.
+// Debounced autosave of the open document. Pixels are stored as 256 px tiles: only layers whose pixels changed
+// since the last save are read (async PBO, no stall; tiled layers read only their tiles), and of those only the
+// tiles whose content hash changed are compressed and written — a stroke on a 4K canvas writes a few tiles,
+// not whole layers. Empty tiles are never stored. Properties and the thumbnail are cheap and always written.
 import type { Engine } from './engine';
 import { store, DocMeta, deflate, inflate } from './store';
 
@@ -9,6 +11,9 @@ export class Autosave {
   docId: string | null = null;
   meta: DocMeta | null = null;
   private saved = new Map<string, number>(); // layer uid -> version stored
+  private hashes = new Map<string, Map<number, number>>(); // layer uid -> tile index -> content hash stored
+  /** what the last save wrote (tests / settings) */
+  lastSave = { tiles: 0, bytes: 0, deleted: 0, ms: 0 };
   private timer = 0;
   state: SaveState = 'saved';
   onState: (s: SaveState) => void = () => {};
@@ -42,9 +47,13 @@ export class Autosave {
   attach(meta: DocMeta, loadedClean: boolean) {
     this.docId = meta.id; this.meta = meta;
     this.onAttach(meta, loadedClean);
-    this.saved.clear();
-    if (loadedClean) for (const l of this.engine.layers) this.saved.set(l.uid, l.version);
+    this.saved.clear(); this.hashes.clear();
+    // a document loaded from tiles knows its stored hashes; older whole-layer documents are rewritten as tiles once
+    const known = loadedHashes && loadedHashes.id === meta.id ? loadedHashes.h : null;
+    if (loadedClean && known) for (const l of this.engine.layers) { this.saved.set(l.uid, l.version); this.hashes.set(l.uid, known.get(l.uid) ?? new Map()); }
+    loadedClean = loadedClean && !!known;
     this.set(loadedClean ? 'saved' : 'pending');
+    if (!loadedClean) this.touch();
   }
   detach() { if (this.docId) this.onDetach(); clearTimeout(this.timer); this.docId = null; this.meta = null; this.saved.clear(); }
 
@@ -71,23 +80,38 @@ export class Autosave {
     try {
       // capture synchronously: layer list, versions, props, and issue all readbacks in GL order
       const layers = [...e.layers];
-      const jobs = layers.filter((l) => this.saved.get(l.uid) !== l.version).map((l) => ({ l, v: l.version, p: e.readLayerAsync(l) }));
+      const jobs = layers.filter((l) => this.saved.get(l.uid) !== l.version).map((l) => ({ l, v: l.version, p: e.readLayerTiles(l) }));
       const thumbP = e.compositeThumbnail(360);
-      const m: DocMeta = { ...meta, w: e.w, h: e.h, bg: [...e.bg] as [number, number, number], bgVisible: e.bgVisible, layers: layers.map((l) => l.props()), active: e.active, modified: Date.now(), extra: this.extra() };
+      const m: DocMeta = { ...meta, storage: 'tiles', w: e.w, h: e.h, bg: [...e.bg] as [number, number, number], bgVisible: e.bgVisible, layers: layers.map((l) => l.props()), active: e.active, modified: Date.now(), extra: this.extra() };
+      const t0 = performance.now();
+      const stat = { tiles: 0, bytes: 0, deleted: 0, ms: 0 };
       for (const j of jobs) {
-        const data = await j.p;
-        const blob = await deflate(data);
+        const tiles = await j.p;
+        const old = this.hashes.get(j.l.uid) ?? new Map<number, number>();
+        const next = new Map<number, number>(), puts: [number, Blob][] = [];
+        for (const [i, d] of tiles) {
+          const hsh = tileHash(d);
+          next.set(i, hsh);
+          if (old.get(i) !== hsh) { const b = await deflate(d); puts.push([i, b]); stat.bytes += b.size; }
+        }
+        const dels = [...old.keys()].filter((i) => !next.has(i));
         if (this.docId !== id) return; // switched documents mid-save
-        await store.putLayer(id, j.l.uid, blob);
+        if (puts.length || dels.length) await store.putTiles(id, j.l.uid, puts, dels);
+        stat.tiles += puts.length; stat.deleted += dels.length;
+        this.hashes.set(j.l.uid, next);
         this.saved.set(j.l.uid, j.v);
       }
+      stat.ms = Math.round(performance.now() - t0);
+      this.lastSave = stat;
       const thumb = await thumbP;
       const tb = await new Promise<Blob | null>((res) => thumb.toBlob(res, 'image/webp', 0.86));
       if (tb) await store.putThumb(id, tb);
       await store.putMeta(m);
       this.meta = m;
-      await store.pruneLayers(id, new Set(layers.map((l) => l.uid)));
-      for (const k of [...this.saved.keys()]) if (!layers.some((l) => l.uid === k)) this.saved.delete(k);
+      const uids = new Set(layers.map((l) => l.uid));
+      await store.pruneTiles(id, uids);
+      if (meta.storage !== 'tiles') await store.pruneLayers(id, new Set()); // converted: drop the whole-layer blobs
+      for (const k of [...this.saved.keys()]) if (!uids.has(k)) { this.saved.delete(k); this.hashes.delete(k); }
       const dirty = e.layers.some((l) => this.saved.get(l.uid) !== l.version);
       this.set(dirty ? 'pending' : 'saved');
       if (dirty) this.touch();
@@ -100,10 +124,33 @@ export class Autosave {
   }
 }
 
-/** load a stored document's pixels */
+/** content hash of a tile (two FNV-style lanes folded into 53 bits) */
+export function tileHash(d: Uint8Array): number {
+  const u = new Uint32Array(d.buffer, d.byteOffset, d.byteLength >> 2);
+  let a = 2166136261, b = 0x9e3779b9 ^ u.length;
+  for (let i = 0; i < u.length; i++) { const x = u[i]; a = Math.imul(a ^ x, 16777619); b = Math.imul(b ^ (x >>> 7 | x << 25), 0x85ebca6b) + i; }
+  return (a >>> 0) * 2097152 + ((b >>> 0) & 0x1fffff);
+}
+let loadedHashes: { id: string; h: Map<string, Map<number, number>> } | null = null;
+
+/** load a stored document's pixels: tiles (current format) or whole layers (documents saved before M4) */
 export async function loadDocPixels(meta: DocMeta) {
+  if (meta.storage === 'tiles') {
+    const all = await store.getTiles(meta.id);
+    const h = new Map<string, Map<number, number>>();
+    const layers = await Promise.all(meta.layers.map(async (props) => {
+      const blobs = all.get(props.uid) ?? new Map<number, Blob>();
+      const tiles = new Map<number, Uint8Array>(), hh = new Map<number, number>();
+      await Promise.all([...blobs].map(async ([i, b]) => { const d = await inflate(b); tiles.set(i, d); hh.set(i, tileHash(d)); }));
+      h.set(props.uid, hh);
+      return { props, tiles, data: null };
+    }));
+    loadedHashes = { id: meta.id, h };
+    return layers;
+  }
+  loadedHashes = null;
   return Promise.all(meta.layers.map(async (props) => {
     const b = await store.getLayer(meta.id, props.uid);
-    return { props, data: b ? await inflate(b) : null };
+    return { props, data: b ? await inflate(b) : null, tiles: null };
   }));
 }

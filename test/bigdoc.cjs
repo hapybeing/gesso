@@ -19,6 +19,8 @@ const { start } = require('./lib.cjs');
     }
     await new Promise((r) => setTimeout(r, 300));
     window.__long.length = 0;
+    const tw = performance.now(); await e.pool.flushAll(new Set([e.activeLayer])); window.__evictMs = Math.round(performance.now() - tw); window.__evictLong = Math.max(0, ...window.__long);
+    window.__long.length = 0;
     let t = performance.now(); await g.autosave.flush(); const saveMs = performance.now() - t; const saveLong = Math.max(0, ...window.__long);
     window.__long.length = 0;
     // a single-layer change: only that layer should be re-saved
@@ -26,7 +28,7 @@ const { start } = require('./lib.cjs');
     t = performance.now(); await g.autosave.flush(); const save1Ms = performance.now() - t; const save1Long = Math.max(0, ...window.__long);
     window.__long.length = 0;
     t = performance.now(); const blob = await g.buildGesso(); const exportMs = performance.now() - t; const exportLong = Math.max(0, ...window.__long);
-    return { saveAllMs: Math.round(saveMs), saveAllLongestTaskMs: saveLong, saveOneLayerMs: Math.round(save1Ms), saveOneLongestTaskMs: save1Long, gessoBytes: blob.size, exportMs: Math.round(exportMs), exportLongestTaskMs: exportLong };
+    return { saveAllMs: Math.round(saveMs), saveAllLongestTaskMs: saveLong, saveOneLayerMs: Math.round(save1Ms), saveOneLongestTaskMs: save1Long, gessoBytes: blob.size, exportMs: Math.round(exportMs), exportLongestTaskMs: exportLong, evictMs: window.__evictMs, evictLongestTaskMs: window.__evictLong, lastSave: g.autosave.lastSave };
   });
   console.log(JSON.stringify(r));
   const sig = () => page.evaluate(() => { const e = window.gesso.engine; return e.layers.map((l) => { const px = e.layerPixels(l, { x: 0, y: 0, w: e.w, h: e.h }); let a = 0; for (let i = 3; i < px.length; i += 4) a += px[i]; return a; }).join(','); });
