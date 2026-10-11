@@ -14,7 +14,9 @@ let layerSeq = 1;
 const newUid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 export interface LayerProps { uid: string; name: string; visible: boolean; opacity: number; blend: number; alphaLock: boolean; clip: boolean;
   /** layer groups: this entry is a group / uid of the group it sits in / collapsed in the layers panel */
-  group?: boolean; parent?: string | null; collapsed?: boolean; }
+  group?: boolean; parent?: string | null; collapsed?: boolean;
+  /** editable text (texttool.TextSpec) while the layer holds exactly the rendered text */
+  text?: unknown; }
 export class Layer implements TiledLayer {
   /** set by the engine: where every layer's pixels live */
   static pool: TilePool;
@@ -31,6 +33,9 @@ export class Layer implements TiledLayer {
   group = false;
   parent: Layer | null = null;
   collapsed = false;
+  /** text layers: the spec it was rendered from, and the version it matches (edits after that make it plain pixels) */
+  text: unknown = null;
+  textVersion = -1;
   // storage (see tiles.ts): sparse atlas tiles, plus a full working texture while the layer is being edited
   res: Target | null = null;
   tiles = new Map<number, TileRef>();
@@ -46,6 +51,7 @@ export class Layer implements TiledLayer {
     const p: LayerProps = { uid: this.uid, name: this.name, visible: this.visible, opacity: this.opacity, blend: this.blend, alphaLock: this.alphaLock, clip: this.clip };
     if (this.group) { p.group = true; p.collapsed = this.collapsed; }
     if (this.parent) p.parent = this.parent.uid;
+    if (this.text && this.textVersion === this.version) p.text = this.text;
     return p;
   }
 }
@@ -1497,7 +1503,7 @@ export class Engine {
     if (!this.layers.length) this.layers = [new Layer('Layer 1')];
     // groups: flags and membership by uid
     const byUid = new Map(this.layers.map((l) => [l.uid, l]));
-    layers.forEach(({ props }, i) => { const l = this.layers[i]; if (!l) return; l.group = !!props.group; l.collapsed = !!props.collapsed; l.parent = (props.parent && byUid.get(props.parent)) || null; });
+    layers.forEach(({ props }, i) => { const l = this.layers[i]; if (!l) return; if (props.text) { l.text = props.text; l.textVersion = l.version; } l.group = !!props.group; l.collapsed = !!props.collapsed; l.parent = (props.parent && byUid.get(props.parent)) || null; });
     for (const l of this.layers) if (l.parent && !l.parent.group) l.parent = null;
     this.bgVisible = bgVisible;
     this.active = Math.max(0, Math.min(this.layers.length - 1, active));
@@ -1728,6 +1734,24 @@ export class Engine {
 
   // ---------------------------------------------------------------- helpers for filter modules (adjust.ts)
   quad() { this.drawQuad(); }
+  /** replace a layer's pixels with a straight-alpha canvas placed at doc (x, y) (no history; null = clear) */
+  drawCanvasToLayer(l: Layer, c: OffscreenCanvas | HTMLCanvasElement | null, x: number, y: number) {
+    const gl = this.gl, t = this.newTarget();
+    if (c) {
+      const src = textureFromCanvas(gl, c as unknown as TexImageSource, false, false);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      bindTarget(gl, t); gl.disable(gl.BLEND); gl.disable(gl.SCISSOR_TEST);
+      this.pPremul.use().tex('uSrc', 0, src).f('uRect', x / this.w, y / this.h, c.width / this.w, c.height / this.h);
+      this.drawQuad();
+      gl.deleteTexture(src);
+    }
+    const old = l.res;
+    l.target = t;
+    if (old && old !== t) freeTarget(gl, old);
+    this.layerChanged(l);
+  }
+  /** put a full-layer stash back (cancelled edits); consumes the stash */
+  restoreStash(l: Layer, st: Stash) { st.writeTo(l.target, 0, 0); st.dispose(); this.layerChanged(l); }
   program(fs: string, vs = S.QUAD_VS): Program {
     const p = new Program(this.gl, vs, fs);
     this.gl.bindAttribLocation(p.prog, 0, 'aPos'); this.gl.linkProgram(p.prog);

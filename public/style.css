@@ -304,3 +304,21 @@ body.anim-on #adjbar{bottom:calc(122px + env(safe-area-inset-bottom,0px))}
 .harm-modes{flex-wrap:wrap;gap:4px;margin:2px 0 6px}
 .harm-modes .chip.small{padding:6px 9px;font-size:13px;min-height:36px}
 .swatches.harm .sw.base{outline:2px solid #fff;outline-offset:-2px}
+/* text tool */
+#textbar{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:11;display:flex;flex-direction:column;align-items:stretch;gap:6px;
+  width:min(900px,96vw);background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:10px 12px;box-shadow:0 8px 30px rgba(0,0,0,.4);animation:pop .14s ease-out}
+body.anim-on #textbar{bottom:calc(122px + env(safe-area-inset-bottom,0px))}
+#textbar .text-in{font:16px system-ui;background:rgba(255,255,255,.06);color:inherit;border:1px solid var(--line);border-radius:12px;padding:8px 10px;resize:vertical;min-height:48px}
+#textbar .chips{flex-wrap:wrap;gap:4px;align-items:center}
+#textbar .chip{padding:8px 11px}
+#textbar .text-row{display:flex;flex-wrap:wrap;gap:4px 16px}
+#textbar .edge-row{display:flex;align-items:center;gap:8px;min-height:44px}
+#textbar .edge-range{width:min(170px,26vw);accent-color:var(--accent);height:40px}
+#textbar .edge-val{min-width:54px;font-variant-numeric:tabular-nums;font-size:13px}
+/* reference window */
+.ref{position:fixed;z-index:12;background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 34px rgba(0,0,0,.5);display:flex;flex-direction:column;overflow:hidden;min-width:180px;min-height:140px}
+.ref-head{display:flex;gap:4px;align-items:center;padding:4px 4px 4px 8px;cursor:move;touch-action:none;flex-wrap:wrap}
+.ref-head .chip.small{padding:5px 9px;font-size:12px;min-height:34px}
+.ref-x{margin-left:auto;font-size:22px;width:40px;height:40px}
+.ref-cv{flex:1;min-height:0;width:100%;background:repeating-conic-gradient(#2a2826 0 25%,#242220 0 50%) 0 0/16px 16px}
+.ref-grip{position:absolute;right:0;bottom:0;width:28px;height:28px;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 55%,rgba(255,255,255,.35) 56% 62%,transparent 63% 72%,rgba(255,255,255,.35) 73% 79%,transparent 80%)}

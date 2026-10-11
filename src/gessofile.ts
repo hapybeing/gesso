@@ -210,7 +210,7 @@ export async function readGesso(blob: Blob, fallbackName = 'Imported'): Promise<
     if (m.version > 1) throw new Error('This file was made by a newer Gesso — update the app to open it');
     const layers = await Promise.all((m.layers as (LayerProps & { file?: string })[]).map(async (l) => ({
       props: { uid: l.uid, name: String(l.name ?? 'Layer'), visible: l.visible !== false, opacity: +l.opacity || 0, blend: Math.max(0, Math.min(BLEND_MODES.length - 1, l.blend | 0)), alphaLock: !!l.alphaLock, clip: !!l.clip,
-        group: !!l.group, parent: l.parent ?? null, collapsed: !!l.collapsed },
+        group: !!l.group, parent: l.parent ?? null, collapsed: !!l.collapsed, text: l.text ?? undefined },
       png: l.group || !l.file ? new Uint8Array(0) : await get(l.file),
     })));
     return { name: m.name || fallbackName, w: m.width | 0, h: m.height | 0, bg: m.background || [1, 1, 1], bgVisible: m.backgroundVisible !== false, active: m.active | 0, layers, extra: m.extra || {} };

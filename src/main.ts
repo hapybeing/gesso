@@ -7,6 +7,8 @@ import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
 import { AdjustUI } from './adjustui';
 import { openStylusTest } from './stylustest';
+import { TextTool } from './texttool';
+import { ReferenceWindow } from './reference';
 import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
 import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
@@ -63,6 +65,7 @@ const ICON = {
   transform: '<path d="M12 3v18M3 12h18"/><path d="M9.5 5.5L12 3l2.5 2.5M9.5 18.5L12 21l2.5-2.5M5.5 9.5L3 12l2.5 2.5M18.5 9.5L21 12l-2.5 2.5"/>',
   film: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/>',
   symmetry: '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 6.5C5.5 7.5 4 10 4 12.5S6 18 9 17.5z"/><path d="M15 6.5c3.5 1 5 3.5 5 6s-2 5.5-5 5z"/>',
+  text: '<path d="M5 6.5V5h14v1.5M12 5v14M9 19h6"/>',
   adjust: '<path d="M4 20l10-10"/><path d="M15.5 4.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/><path d="M19.5 11l.4 1 1 .4-1 .4-.4 1-.4-1-1-.4 1-.4z"/><path d="M14 10l-2-2"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
 };
@@ -130,6 +133,8 @@ class App {
   xform: TransformTool | null = null;
   selTool: SelectTool | null = null;
   adj!: AdjustUI;
+  text!: TextTool;
+  ref!: ReferenceWindow;
   selBar: HTMLElement | null = null;
   strokeBrush: Brush | null = null;
   tl: TimelapseRecorder;
@@ -179,7 +184,10 @@ class App {
     this.autosave.extra = () => this.docExtra();
     this.adj = new AdjustUI({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), overlayChanged: () => { this.ovDirty = true; },
       changed: () => { $('#bAdjust')?.classList.toggle('on', this.adj.active); this.updateUndoButtons(); } });
-    this.autosave.blocked = () => !!this.xform || this.shapes.active || this.adj.active;
+    this.text = new TextTool({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), color: () => [...this.state.color] as [number, number, number],
+      changed: () => { $('#bText')?.classList.toggle('on', this.text.active); this.updateUndoButtons(); }, overlayChanged: () => { this.ovDirty = true; } });
+    this.ref = new ReferenceWindow({ engine: this.engine, setColor: (c) => this.setColor(c), toast: (m) => this.toast(m) });
+    this.autosave.blocked = () => !!this.xform || this.shapes.active || this.adj.active || !!this.text.layer;
     this.anim = new Animator({
       engine: this.engine,
       toast: (m) => this.toast(m),
@@ -665,6 +673,7 @@ class App {
     this.selTool?.drawOverlay(g);
     this.adj?.drawOverlay(g);
     this.drawPrediction(g);
+    this.text?.drawOverlay(g);
   }
 
   undo() {
@@ -743,6 +752,7 @@ class App {
       tb('bExport', ICON.share, 'Export PNG', () => this.exportPNG()),
       tb('bSelect', ICON.select, 'Select', () => this.toggleSelectTool()),
       tb('bTransform', ICON.transform, 'Transform', () => void this.startLayerTransform()),
+      tb('bText', ICON.text, 'Text', () => { this.settle(); this.closePop(); if (this.text.active) this.text.disarm(); else { if (this.selTool) this.exitSelectTool(); this.text.arm(); } }),
       tb('bAdjust', ICON.adjust, 'Adjustments', () => this.togglePop('adjust', (el) => this.adj.renderMenu(el, () => this.closePop()))),
     );
     const right = h('div', { class: 'grp' },
@@ -818,6 +828,7 @@ class App {
 
   pickTool(t: Tool, silent = false) {
     this.settle();
+    if (this.text?.active) this.text.disarm();
     if (this.selTool && !silent) this.exitSelectTool();
     const same = this.tool === t;
     this.tool = t;
@@ -1134,6 +1145,7 @@ class App {
         act('Move down', ICON.down, () => e.moveBlock(l, -1), e.active <= 0 && !l.parent),
         act('Duplicate', ICON.copy, () => { if (!e.duplicateLayer()) this.toast('Not enough memory for another layer'); }),
         act('Merge down', ICON.merge, () => e.mergeDown(), !below || below.group || below.parent !== l.parent),
+        ...(l.text && l.textVersion === l.version ? [act('Edit text', ICON.text, () => { this.closePop(); this.text.edit(l); })] : []),
         act('Fill with colour', ICON.fill, () => e.fillLayer(this.state.color)),
         act('Clear', ICON.clear, () => e.clearLayer()),
         act('Delete', ICON.trash, () => e.deleteLayer(), e.layers.length <= 1)),
@@ -1165,6 +1177,8 @@ class App {
       item('Rename…', () => void this.renameCurrent()),
       item('New canvas…', () => this.showNewCanvas(false)),
       item('Insert a photo', () => this.importPhoto(), 'move · scale · rotate'),
+      item(this.ref.open ? 'Reference: on' : 'Reference window', () => this.ref.toggle(), 'whole canvas or an image · pick colours'),
+      item('Add text', () => { if (!this.text.active) this.text.arm(); }, 'system and bundled fonts'),
       item('Export PNG', () => this.exportPNG()),
       item('Export PNG (transparent)', () => this.exportPNG(false)),
       item(this.anim.on ? 'Animation: on' : 'Animation', () => { this.anim.toggle(); $('#bAnim').classList.toggle('on', this.anim.on); }, 'frames, onion skin, playback'),
