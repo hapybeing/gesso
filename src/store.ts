@@ -15,7 +15,16 @@ export interface DocMeta {
   extra?: Record<string, unknown>;
 }
 
-const DB = 'gesso', VER = 1;
+/** a batch of recorded time-lapse frames (one encoder segment can span many packs) */
+export interface TlPack {
+  seg: number;
+  /** WebCodecs decoder config of the segment (description as bytes), or kind 'img' for the image fallback */
+  config: { codec: string; codedWidth: number; codedHeight: number; description?: Uint8Array } | null;
+  w: number; h: number;
+  frames: { key: boolean; data: ArrayBuffer; area: number }[];
+}
+
+const DB = 'gesso', VER = 2;
 let dbp: Promise<IDBDatabase> | null = null;
 function db(): Promise<IDBDatabase> {
   if (!dbp) dbp = new Promise((res, rej) => {
@@ -25,6 +34,7 @@ function db(): Promise<IDBDatabase> {
       if (!d.objectStoreNames.contains('docs')) d.createObjectStore('docs', { keyPath: 'id' });
       if (!d.objectStoreNames.contains('layers')) d.createObjectStore('layers');
       if (!d.objectStoreNames.contains('thumbs')) d.createObjectStore('thumbs');
+      if (!d.objectStoreNames.contains('tl')) d.createObjectStore('tl'); // time-lapse packs: docId/seq
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -61,8 +71,22 @@ export const store = {
       for (const k of keys) if (!keep.has(String(k).slice(docId.length + 1))) os.delete(k);
     });
   },
+  /** time-lapse: packs of encoded frames, keyed docId/00000001 */
+  putTl: (docId: string, seq: number, pack: TlPack) => tx(['tl'], 'readwrite', (t) => req(t.objectStore('tl').put(pack, docId + '/' + String(seq).padStart(8, '0')))).then(() => {}),
+  getTl: (docId: string) => tx(['tl'], 'readonly', (t) => req(t.objectStore('tl').getAll(range(docId)) as IDBRequest<TlPack[]>)),
+  countTl: (docId: string) => tx(['tl'], 'readonly', (t) => req(t.objectStore('tl').count(range(docId)))),
+  /** next pack number and the last segment id recorded for a document */
+  async lastTl(docId: string): Promise<{ next: number; seg: number }> {
+    return tx(['tl'], 'readonly', (t) => new Promise((res, rej) => {
+      const r = t.objectStore('tl').openCursor(range(docId), 'prev');
+      r.onsuccess = () => { const c = r.result; if (!c) res({ next: 0, seg: -1 }); else res({ next: parseInt(String(c.key).slice(docId.length + 1), 10) + 1, seg: (c.value as TlPack).seg }); };
+      r.onerror = () => rej(r.error);
+    }));
+  },
+  clearTl: (docId: string) => tx(['tl'], 'readwrite', (t) => req(t.objectStore('tl').delete(range(docId)))).then(() => {}),
   async remove(docId: string) {
-    await tx(['docs', 'layers', 'thumbs'], 'readwrite', (t) => {
+    await tx(['docs', 'layers', 'thumbs', 'tl'], 'readwrite', (t) => {
+      t.objectStore('tl').delete(range(docId));
       t.objectStore('docs').delete(docId);
       t.objectStore('layers').delete(range(docId));
       t.objectStore('thumbs').delete(docId);
@@ -73,7 +97,11 @@ export const store = {
     if (!m) return null;
     const now = Date.now();
     const copy: DocMeta = { ...structuredClone(m), id: newId, name, created: now, modified: now };
-    await tx(['docs', 'layers', 'thumbs'], 'readwrite', async (t) => {
+    await tx(['docs', 'layers', 'thumbs', 'tl'], 'readwrite', async (t) => {
+      const tl = t.objectStore('tl');
+      const tk = await req(tl.getAllKeys(range(docId)));
+      const tv = await req(tl.getAll(range(docId)));
+      tk.forEach((k, i) => tl.put(tv[i], newId + String(k).slice(docId.length)));
       const ls = t.objectStore('layers');
       const keys = await req(ls.getAllKeys(range(docId)));
       const vals = await req(ls.getAll(range(docId)));

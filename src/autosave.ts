@@ -36,13 +36,17 @@ export class Autosave {
   }
 
   /** start tracking a document that was just created or loaded */
+  /** hooks for per-document companions (time-lapse recorder) */
+  onAttach: (meta: DocMeta, loadedClean: boolean) => void = () => {};
+  onDetach: () => void = () => {};
   attach(meta: DocMeta, loadedClean: boolean) {
     this.docId = meta.id; this.meta = meta;
+    this.onAttach(meta, loadedClean);
     this.saved.clear();
     if (loadedClean) for (const l of this.engine.layers) this.saved.set(l.uid, l.version);
     this.set(loadedClean ? 'saved' : 'pending');
   }
-  detach() { clearTimeout(this.timer); this.docId = null; this.meta = null; this.saved.clear(); }
+  detach() { if (this.docId) this.onDetach(); clearTimeout(this.timer); this.docId = null; this.meta = null; this.saved.clear(); }
 
   private chain: Promise<void> = Promise.resolve();
   private queued: Promise<void> | null = null;

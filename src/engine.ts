@@ -27,6 +27,8 @@ export class Layer {
 }
 
 export type Tool = 'brush' | 'eraser' | 'smudge';
+/** one compositing step: a layer drawn with an opacity, optional tint (rgb + amount) and clipping base */
+export interface DrawItem { layer: Layer; opacity: number; blend?: number; tint?: [number, number, number, number]; clipBase?: Layer | null; }
 
 interface StrokeState {
   layer: Layer;
@@ -291,20 +293,17 @@ export class Engine {
     gl.clear(gl.COLOR_BUFFER_BIT);
     const p = this.pComposite.use();
     this.setStrokeUniforms(p, null);
-    let clipBase: Layer | null = null;
-    for (let i = 0; i < this.layers.length; i++) {
-      const l = this.layers[i];
-      if (!l.clip) clipBase = l;
-      const clipped = l.clip && clipBase && clipBase !== l;
-      if (!l.visible || l.opacity <= 0) continue;
-      if (clipped && !clipBase!.visible) continue;
+    const items = this.drawItems();
+    for (const it of items) {
+      const l = it.layer, clipBase = it.clipBase;
       bindTarget(gl, dst);
       this.setStrokeUniforms(p, l);
       p.i('uActive', this.cur && this.cur.layer === l ? 1 : 0);
       p.tex('uPrev', 0, src.tex).tex('uLayer', 1, l.target.tex);
-      p.i('uMode', l.blend).f('uOpacity', l.opacity);
-      if (clipped) {
-        p.tex('uClip', 2, clipBase!.target.tex);
+      p.i('uMode', it.blend ?? l.blend).f('uOpacity', it.opacity);
+      const t = it.tint; p.f('uTint', t ? t[0] : 0, t ? t[1] : 0, t ? t[2] : 0, t ? t[3] : 0);
+      if (clipBase) {
+        p.tex('uClip', 2, clipBase.target.tex);
         p.i('uClipMode', this.cur && this.cur.layer === clipBase && this.cur.tool !== 'smudge' ? 2 : 1);
         if (this.cur && this.cur.layer === clipBase && this.cur.layer !== l) {
           // the shared stroke uniforms belong to the base when the base is being painted
@@ -313,15 +312,34 @@ export class Engine {
         }
       } else { p.i('uClipMode', 0); p.tex('uClip', 2, null); }
       this.drawQuad();
-      const t = src; src = dst; dst = t;
+      const tt = src; src = dst; dst = tt;
     }
-    this.stats.compositePx += r.w * r.h * Math.max(1, this.layers.length);
+    this.stats.compositePx += r.w * r.h * Math.max(1, items.length);
     this.mipStale = true;
     // copy result into comp
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb);
     gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, this.comp.fb);
     gl.blitFramebuffer(r.x, r.y, r.x + r.w, r.y + r.h, r.x, r.y, r.x + r.w, r.y + r.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     gl.disable(gl.SCISSOR_TEST);
+  }
+
+  /**
+   * What the compositor draws, bottom to top. Normally every visible layer (clipping masks resolved);
+   * animation mode replaces it with the current frame, onion skins and background/foreground layers.
+   */
+  drawList: DrawItem[] | null = null;
+  drawItems(): DrawItem[] {
+    if (this.drawList) return this.drawList;
+    const out: DrawItem[] = [];
+    let clipBase: Layer | null = null;
+    for (const l of this.layers) {
+      if (!l.clip) clipBase = l;
+      const clipped = l.clip && clipBase && clipBase !== l;
+      if (!l.visible || l.opacity <= 0) continue;
+      if (clipped && !clipBase!.visible) continue;
+      out.push({ layer: l, opacity: l.opacity, clipBase: clipped ? clipBase : null });
+    }
+    return out;
   }
 
   viewMatrix(cw: number, ch: number): Float32Array {
@@ -665,7 +683,7 @@ export class Engine {
     bindTarget(gl, this.thumbT);
     gl.disable(gl.BLEND);
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
-    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h);
+    this.pDown.use().tex('uSrc', 0, layer.target.tex).f('uStep', scale / this.w, scale / this.h).f('uOver', 0, 0, 0, 0);
     this.drawQuad();
     const px = this.readRect(this.thumbT, { x: 0, y: 0, w: tw, h: th });
     const img = new ImageData(tw, th);
@@ -1029,7 +1047,7 @@ export class Engine {
     gl.disable(gl.BLEND);
     gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    this.pDown.use().tex('uSrc', 0, src.tex).f('uStep', 1 / tw, 1 / th);
+    this.pDown.use().tex('uSrc', 0, src.tex).f('uStep', 1 / tw, 1 / th).f('uOver', 0, 0, 0, 0);
     this.drawQuad();
     const px = await new Readback(gl, t.fb, 0, 0, tw, th).wait();
     freeTarget(gl, t);
@@ -1042,6 +1060,39 @@ export class Engine {
     out.getContext('2d')!.putImageData(img, 0, 0);
     return out;
   }
+
+  private capT: Target | null = null;
+  /**
+   * The composite (or a custom draw list, e.g. one animation frame) scaled to ow×oh, as RGBA top row first,
+   * read back asynchronously. flatten: composite onto that colour so the result is opaque (video frames);
+   * otherwise premultiplied. The live display composite is restored on the next frame when it was replaced.
+   */
+  captureScaled(ow: number, oh: number, opts: { list?: DrawItem[] | null; withBg?: boolean; flatten?: [number, number, number] | null } = {}): Promise<Uint8Array> {
+    const gl = this.gl;
+    const withBg = opts.withBg ?? this.bgVisible;
+    const custom = opts.list !== undefined || withBg !== this.bgVisible;
+    if (custom) {
+      const keep = this.drawList;
+      if (opts.list !== undefined) this.drawList = opts.list;
+      this.composite({ x: 0, y: 0, w: this.w, h: this.h }, withBg);
+      this.drawList = keep;
+      this.markDirty();
+    } else if (this.dirty) { this.composite(this.dirty); this.dirty = null; this.needsPresent = true; }
+    const flat = opts.flatten;
+    if (ow === this.w && oh === this.h && !flat) return new Readback(gl, this.comp.fb, 0, 0, ow, oh).wait();
+    if (!this.capT || this.capT.w !== ow || this.capT.h !== oh) { if (this.capT) freeTarget(gl, this.capT); this.capT = makeTarget(gl, ow, oh); }
+    bindTarget(gl, this.capT);
+    gl.disable(gl.BLEND);
+    gl.bindTexture(gl.TEXTURE_2D, this.comp.tex);
+    // the 4×4 supersampled pass alone is a good box filter down to 1/4 scale; mips only below that
+    if (ow * 4 < this.w || oh * 4 < this.h) { if (this.mipStale) { gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false; } gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); }
+    else gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    this.pDown.use().tex('uSrc', 0, this.comp.tex).f('uStep', 1 / ow, 1 / oh).f('uOver', flat ? flat[0] : 0, flat ? flat[1] : 0, flat ? flat[2] : 0, flat ? 1 : 0);
+    this.drawQuad();
+    return new Readback(gl, this.capT.fb, 0, 0, ow, oh).wait();
+  }
+  /** the background colour (or white when hidden), for flattening video frames */
+  get flattenColour(): [number, number, number] { return this.bgVisible ? this.bg : [1, 1, 1]; }
 
   /** full composite, premultiplied RGBA (top row first), read back asynchronously */
   async compositePixelsAsync(withBg = this.bgVisible): Promise<Uint8Array> {

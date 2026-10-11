@@ -6,6 +6,8 @@ import { pressureSection } from './pressureui';
 import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
+import { $, h } from './dom';
+import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
 import { readGesso, writeGesso } from './gessofile';
 import { pngEncode } from './workerclient';
 import { ShapeTool } from './shapetool';
@@ -19,19 +21,6 @@ import type { Dab } from './engine';
 import { RGB, HSV, hsvToRgb, rgbToHsv, toHex, fromHex } from './color';
 
 // ------------------------------------------------------------------ helpers
-const $ = <T extends HTMLElement = HTMLElement>(s: string, r: ParentNode = document) => r.querySelector(s) as T;
-function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Record<string, any> = {}, ...kids: (Node | string | null | undefined)[]): HTMLElementTagNameMap[K] {
-  const e = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k === 'class') e.className = v;
-    else if (k.startsWith('on')) (e as any)[k.toLowerCase()] = v;
-    else if (k === 'style') e.setAttribute('style', v);
-    else if (v === true) e.setAttribute(k, '');
-    else if (v !== false && v != null) e.setAttribute(k, String(v));
-  }
-  for (const c of kids) if (c != null) e.append(c);
-  return e;
-}
 const svg = (d: string, extra = '') => {
   const t = document.createElement('template');
   t.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" ${extra}>${d}</svg>`;
@@ -127,6 +116,8 @@ class App {
   selTool: SelectTool | null = null;
   selBar: HTMLElement | null = null;
   strokeBrush: Brush | null = null;
+  tl: TimelapseRecorder;
+  tlView: TimelapseView | null = null;
 
   constructor() {
     this.canvas = $('#view') as HTMLCanvasElement;
@@ -154,7 +145,7 @@ class App {
       committed: () => this.pushRecent(),
     });
     this.shapes.delay = this.state.settings.snapDelay;
-    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { this.settle(); void this.autosave.flush(); } });
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { this.settle(); void this.autosave.flush(); void this.tl.flush(); } });
     this.input.stylusMode = this.state.settings.stylus;
     this.curve.set(...this.state.settings.curve);
     this.engine.history.maxSteps = 250;
@@ -168,11 +159,22 @@ class App {
     this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
     this.autosave.extra = () => this.docExtra();
     this.autosave.blocked = () => !!this.xform || this.shapes.active;
+    this.tl = new TimelapseRecorder(this.engine);
+    this.tl.blocked = () => !!this.xform || this.shapes.active;
+    this.autosave.onAttach = (meta, clean) => {
+      const x = (meta.extra?.timelapse || {}) as { on?: boolean };
+      this.tl.attach(meta.id, x.on !== false);
+      if (!clean) this.tl.request(1); // a new or imported artwork: its starting state is frame 0
+    };
+    this.autosave.onDetach = () => this.tl.detach();
     window.addEventListener('paste', (ev) => {
       const f = [...(ev.clipboardData?.files || [])].find((x) => x.type.startsWith('image/'));
       if (f) { ev.preventDefault(); void this.placeImage(f, 'Pasted image'); }
     });
-    this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); this.selTool?.invalidateWand(); if (this.selBar) this.renderSelBar(); };
+    this.engine.history.onChange = () => {
+      const hs = this.engine.history;
+      if (hs.lastTouched && (hs.canUndo || hs.canRedo)) this.tl.request(hs.lastTouched.bytes <= 64 ? 0.3 : Math.min(1, hs.lastTouched.bytes / (this.engine.w * this.engine.h * 4)));
+      this.updateUndoButtons(); this.autosave.touch(); this.selTool?.invalidateWand(); if (this.selBar) this.renderSelBar(); };
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installEvt = e; });
     this.keys();
     const loop = () => { this.engine.render(); if (this.ovDirty) this.drawOverlay(); requestAnimationFrame(loop); };
@@ -214,7 +216,7 @@ class App {
   }
 
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym } }; }
+  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym }, timelapse: { on: this.tl.enabled } }; }
   applyDocExtra(x: Record<string, unknown>) {
     const s = x.symmetry as Partial<Symmetry> | undefined;
     this.sym = { ...defaultSymmetry(this.engine.w, this.engine.h), ...(s || {}) };
@@ -988,6 +990,7 @@ class App {
       item('Insert a photo', () => this.importPhoto(), 'move · scale · rotate'),
       item('Export PNG', () => this.exportPNG()),
       item('Export PNG (transparent)', () => this.exportPNG(false)),
+      item('Time-lapse', () => this.openTimelapse(), this.tl.enabled ? `${this.tl.frames} steps recorded` : 'recording paused'),
       item('Export .gesso file', () => void this.exportGessoFile(), 'layers kept · opens in Krita as .ora'),
       item('Import .gesso / .ora…', () => this.importGessoFile()),
       item('Fit canvas to screen', () => this.fit()),
@@ -996,6 +999,18 @@ class App {
       item('Settings', () => this.showSettings()),
       item('Gestures & help', () => this.showHelp()),
     ].filter(Boolean) as HTMLElement[]);
+  }
+
+  openTimelapse() {
+    this.settle();
+    if (this.tlView) return;
+    this.tlView = new TimelapseView({
+      engine: this.engine, recorder: this.tl,
+      docName: () => this.autosave.meta?.name || 'Gesso',
+      download: (b, n, t) => this.download(b, n, t),
+      toast: (m) => this.toast(m),
+      closed: () => { this.tlView = null; this.autosave.touch(); },
+    });
   }
 
   sheet(title: string) {
@@ -1221,3 +1236,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 (window as any).gesso = new App();
+(window as any).gessoTest = { loadClip, exportClip, selectFrames };

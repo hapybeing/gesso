@@ -13,6 +13,8 @@ export class History {
   maxBytes = 512 * 1024 * 1024;
   maxSteps = 120;
   onChange: () => void = () => {};
+  /** the entry most recently pushed, undone or redone (null after clear) */
+  lastTouched: Entry | null = null;
 
   private group: Entry[] | null = null;
   /** collect the following pushes into one undo step */
@@ -34,6 +36,7 @@ export class History {
     // drop redo branch
     for (const x of this.list.splice(this.idx)) x.dispose?.(false);
     this.list.push(e);
+    this.lastTouched = e;
     this.idx = this.list.length;
     this.trim();
     this.onChange();
@@ -52,17 +55,19 @@ export class History {
   undo(): string | null {
     if (!this.canUndo) return null;
     const e = this.list[--this.idx];
+    this.lastTouched = e;
     e.undo(); this.onChange();
     return e.label;
   }
   redo(): string | null {
     if (!this.canRedo) return null;
     const e = this.list[this.idx++];
+    this.lastTouched = e;
     e.redo(); this.onChange();
     return e.label;
   }
   clear() {
     this.list.forEach((e, i) => e.dispose?.(i < this.idx));
-    this.list = []; this.idx = 0; this.onChange();
+    this.list = []; this.idx = 0; this.lastTouched = null; this.onChange();
   }
 }

@@ -93,12 +93,14 @@ uniform sampler2D uPrev, uLayer, uClip;
 uniform int uMode; uniform float uOpacity;
 uniform int uClipMode; // 0 none, 1 clip, 2 clip with live-stroked base
 uniform int uActive;
+uniform vec4 uTint; // rgb + amount (onion skins)
 ${STROKE_CHUNK}
 ${BLEND_CHUNK}
 void main(){
   vec4 b = texture(uPrev, vUv);
   vec4 s = texture(uLayer, vUv);
   if (uActive == 1) s = applyStroke(s, vUv);
+  s.rgb = mix(s.rgb, uTint.rgb * s.a, uTint.a);
   s *= uOpacity;
   if (uClipMode > 0) {
     vec4 c = texture(uClip, vUv);
@@ -221,12 +223,13 @@ void main(){
 export const DOWNSAMPLE_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
-uniform sampler2D uSrc; uniform vec2 uStep;
+uniform sampler2D uSrc; uniform vec2 uStep; uniform vec4 uOver; // uOver.a = 1: flatten onto uOver.rgb
 void main(){
   vec4 acc = vec4(0.0);
   for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++)
     acc += texture(uSrc, vUv + (vec2(float(x), float(y)) - 1.5) * uStep * 0.25);
   o = acc / 16.0;
+  if (uOver.a > 0.5) o = vec4(o.rgb + uOver.rgb * (1.0 - o.a), 1.0);
 }`;
 
 // Upload a straight-alpha image into premultiplied layer space.
