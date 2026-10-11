@@ -230,3 +230,7 @@ input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
 .tl-busy{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px 20px;display:flex;flex-direction:column;gap:10px;min-width:260px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
 .tl-progress{height:6px;border-radius:3px;background:rgba(255,255,255,.1);overflow:hidden}
 .tl-progress i{display:block;height:100%;width:0;background:var(--accent);transition:width .1s}
+#selbar .edge-row{display:flex;align-items:center;gap:10px;min-height:44px}
+#selbar .edge-range{width:min(260px,40vw);accent-color:var(--accent);height:40px}
+#selbar .edge-val{min-width:64px;font-variant-numeric:tabular-nums;font-size:14px}
+#selbar .edge-row > span{min-width:104px;text-align:right}

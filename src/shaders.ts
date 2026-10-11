@@ -264,6 +264,14 @@ void main(){
   gl_Position = vec4(d.xy / uDocSize * 2.0 - 1.0, 0.0, 1.0);
 }`;
 
+// Mesh variant (distort / warp): vertices carry doc position and source uv; the domain is grown past [0,1]
+// so XFORM_FS can fade the edges in destination pixels exactly like the affine path.
+export const MESH_VS = `#version 300 es
+in vec2 aPos; in vec2 aUv;
+uniform vec2 uDocSize;
+out vec2 vUv;
+void main(){ vUv = aUv; gl_Position = vec4(aPos / uDocSize * 2.0 - 1.0, 0.0, 1.0); }`;
+
 export const XFORM_FS = `#version 300 es
 precision highp float;
 in vec2 vUv; out vec4 o;
@@ -337,4 +345,55 @@ void main(){
   else if (uMode == 1) o = L * (1.0 - m);
   else if (uMode == 2) o = L * m;
   else o = L * (1.0 - m);
+}`;
+
+
+// Jump flooding (selection grow/shrink): every pixel finds its nearest seed pixel in log2(size) passes.
+// Seed coordinates are packed into RGBA8 (16 bits per axis); all-ones means "no seed yet".
+const JFA_PACK = `
+vec4 pack(ivec2 p){ return vec4(float(p.x / 256), float(p.x % 256), float(p.y / 256), float(p.y % 256)) / 255.0; }
+ivec2 unpack(vec4 c){ ivec4 b = ivec4(c * 255.0 + 0.5); return ivec2(b.r * 256 + b.g, b.b * 256 + b.a); }
+const ivec2 NONE = ivec2(65535);`;
+export const JFA_INIT_FS = `#version 300 es
+precision highp float; precision highp int;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSel; uniform int uInside;
+${JFA_PACK}
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  float m = texelFetch(uSel, p, 0).r;
+  bool seed = uInside == 1 ? m >= 0.5 : m < 0.5;
+  o = seed ? pack(p) : pack(NONE);
+}`;
+export const JFA_STEP_FS = `#version 300 es
+precision highp float; precision highp int;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSrc; uniform int uStep; uniform ivec2 uSize;
+${JFA_PACK}
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  ivec2 best = NONE; float bd = 1e20;
+  for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
+    ivec2 q = p + ivec2(x, y) * uStep;
+    if (q.x < 0 || q.y < 0 || q.x >= uSize.x || q.y >= uSize.y) continue;
+    ivec2 s = unpack(texelFetch(uSrc, q, 0));
+    if (s.x == 65535) continue;
+    vec2 d = vec2(s - p); float dd = dot(d, d);
+    if (dd < bd) { bd = dd; best = s; }
+  }
+  o = pack(best);
+}`;
+// Grow (uR > 0) or shrink (uR < 0) the mask by |uR| px with a 1 px anti-aliased edge; soft interiors are kept.
+export const GROW_FS = `#version 300 es
+precision highp float; precision highp int;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uSel, uIn, uOut; uniform float uR;
+${JFA_PACK}
+float dist(sampler2D t, ivec2 p){ ivec2 s = unpack(texelFetch(t, p, 0)); return s.x == 65535 ? 1e9 : length(vec2(s - p)); }
+void main(){
+  ivec2 p = ivec2(gl_FragCoord.xy);
+  float m = texelFetch(uSel, p, 0).r, r = m;
+  if (uR > 0.0) r = max(m, clamp(uR + 1.0 - dist(uIn, p), 0.0, 1.0));
+  else if (uR < 0.0) r = min(m, clamp(dist(uOut, p) + uR, 0.0, 1.0));
+  o = vec4(r, r, r, 1.0);
 }`;

@@ -112,7 +112,7 @@ export class Engine {
   private dabBuf!: WebGLBuffer;
   private dabData = new Float32Array(6 * 4096);
   private pComposite!: Program; private pBake!: Program; private pMerge!: Program; private pDab!: Program;
-  private pSmudge!: Program; private pPickup!: Program; private pScreen!: Program; private pDown!: Program; private pPremul!: Program; private pFill!: Program; private pXform!: Program; private pMaskOp!: Program; private pBlur!: Program; private pSelop!: Program;
+  private pSmudge!: Program; private pPickup!: Program; private pScreen!: Program; private pDown!: Program; private pPremul!: Program; private pFill!: Program; private pXform!: Program; private pMaskOp!: Program; private pBlur!: Program; private pSelop!: Program; private pMesh!: Program; private pJfaInit!: Program; private pJfaStep!: Program; private pGrow!: Program;
   private shapes = new Map<ShapeId, WebGLTexture>();
   private grains = new Map<GrainId, WebGLTexture>();
   private stroke!: Target;   // coverage buffer
@@ -164,13 +164,18 @@ export class Engine {
     this.pMaskOp = new Program(gl, S.QUAD_VS, S.MASKOP_FS);
     this.pBlur = new Program(gl, S.QUAD_VS, S.BLUR_FS);
     this.pSelop = new Program(gl, S.QUAD_VS, S.SELOP_FS);
+    this.pMesh = new Program(gl, S.MESH_VS, S.XFORM_FS);
+    this.pJfaInit = new Program(gl, S.QUAD_VS, S.JFA_INIT_FS);
+    this.pJfaStep = new Program(gl, S.QUAD_VS, S.JFA_STEP_FS);
+    this.pGrow = new Program(gl, S.QUAD_VS, S.GROW_FS);
+    gl.bindAttribLocation(this.pMesh.prog, 0, 'aPos'); gl.bindAttribLocation(this.pMesh.prog, 1, 'aUv'); gl.linkProgram(this.pMesh.prog);
 
     const quad = new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]);
     this.quadVao = gl.createVertexArray()!;
     gl.bindVertexArray(this.quadVao);
     const qb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, qb); gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
     // all quad programs bind aPos at location 0
-    for (const p of [this.pComposite, this.pBake, this.pMerge, this.pSmudge, this.pPickup, this.pScreen, this.pDown, this.pPremul, this.pFill, this.pXform, this.pMaskOp, this.pBlur, this.pSelop]) {
+    for (const p of [this.pComposite, this.pBake, this.pMerge, this.pSmudge, this.pPickup, this.pScreen, this.pDown, this.pPremul, this.pFill, this.pXform, this.pMaskOp, this.pBlur, this.pSelop, this.pJfaInit, this.pJfaStep, this.pGrow]) {
       gl.bindAttribLocation(p.prog, 0, 'aPos'); gl.linkProgram(p.prog);
     }
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
@@ -850,19 +855,78 @@ export class Engine {
   /** soften the selection edge by a gaussian of the given radius (doc px) */
   featherSelection(radius: number) {
     if (!this.sel || radius <= 0) return;
+    const b = this.newTarget(), tmp = this.newTarget();
+    this.blurMask(this.sel, b, tmp, radius);
+    freeTarget(this.gl, tmp);
+    this.setSelection(b, 'Feather selection');
+  }
+  /** separable gaussian of a mask (src → dst, tmp as scratch) */
+  private blurMask(src: Target, dst: Target, tmp: Target, radius: number) {
     const gl = this.gl;
     const sigma = radius / 2;
     const step = Math.max(1, (sigma * 3) / 48), taps = Math.min(64, Math.ceil((sigma * 3) / step));
-    const a = this.newTarget(), b = this.newTarget();
+    gl.disable(gl.BLEND);
+    bindTarget(gl, tmp);
+    this.pBlur.use().tex('uSrc', 0, src.tex).f('uDir', step / this.w, 0).f('uSigma', sigma / step).i('uTaps', taps);
+    this.drawQuad();
+    bindTarget(gl, dst);
+    this.pBlur.use().tex('uSrc', 0, tmp.tex).f('uDir', 0, step / this.h).f('uSigma', sigma / step).i('uTaps', taps);
+    this.drawQuad();
+  }
+  /** nearest-seed field of the selection: inside = seeds where mask ≥ 0.5, else where it is < 0.5 */
+  private jumpFlood(inside: boolean): Target {
+    const gl = this.gl;
+    let a = this.newTarget(), b = this.newTarget();
+    for (const t of [a, b]) { gl.bindTexture(gl.TEXTURE_2D, t.tex); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); }
     gl.disable(gl.BLEND);
     bindTarget(gl, a);
-    this.pBlur.use().tex('uSrc', 0, this.sel.tex).f('uDir', step / this.w, 0).f('uSigma', sigma / step).i('uTaps', taps);
+    this.pJfaInit.use().tex('uSel', 0, this.sel!.tex).i('uInside', inside ? 1 : 0);
     this.drawQuad();
-    bindTarget(gl, b);
-    this.pBlur.use().tex('uSrc', 0, a.tex).f('uDir', 0, step / this.h).f('uSigma', sigma / step).i('uTaps', taps);
-    this.drawQuad();
-    freeTarget(gl, a);
-    this.setSelection(b, 'Feather selection');
+    let step = 1; while (step * 2 < Math.max(this.w, this.h)) step *= 2;
+    const steps: number[] = []; for (let k = step; k >= 1; k = k >> 1) steps.push(k);
+    steps.push(1); // JFA+1 pass removes most of the remaining errors
+    const p = this.pJfaStep.use();
+    gl.uniform2i(p.u('uSize'), this.w, this.h);
+    for (const k of steps) {
+      bindTarget(gl, b);
+      p.tex('uSrc', 0, a.tex).i('uStep', k);
+      this.drawQuad();
+      const t = a; a = b; b = t;
+    }
+    freeTarget(gl, b);
+    return a;
+  }
+  /**
+   * Live edge refinement of the selection: grow/shrink (signed px) then feather. Distance fields are built once,
+   * so each preview is one cheap pass (+ the blur). The preview replaces the displayed mask until commit/cancel.
+   */
+  beginEdgeAdjust(): { preview(grow: number, feather: number): void; commit(): void; cancel(): void } | null {
+    if (!this.sel) return null;
+    const gl = this.gl, orig = this.sel;
+    // distance fields are built on first use: growing needs the inside field, shrinking the outside one
+    let fIn: Target | null = null, fOut: Target | null = null;
+    const grown = this.newTarget(), out = this.newTarget(), tmp = this.newTarget();
+    let shown: Target = orig;
+    const free = () => { for (const t of [fIn, fOut, grown, tmp]) if (t) freeTarget(gl, t); };
+    return {
+      preview: (g, f) => {
+        if (g > 0 && !fIn) { this.sel = orig; fIn = this.jumpFlood(true); }
+        if (g < 0 && !fOut) { this.sel = orig; fOut = this.jumpFlood(false); }
+        gl.disable(gl.BLEND);
+        bindTarget(gl, grown);
+        this.pGrow.use().tex('uSel', 0, orig.tex).tex('uIn', 1, (fIn || orig).tex).tex('uOut', 2, (fOut || orig).tex).f('uR', g);
+        this.drawQuad();
+        if (f > 0) this.blurMask(grown, out, tmp, f);
+        else { gl.bindFramebuffer(gl.READ_FRAMEBUFFER, grown.fb); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, out.fb); gl.blitFramebuffer(0, 0, this.w, this.h, 0, 0, this.w, this.h, gl.COLOR_BUFFER_BIT, gl.NEAREST); }
+        shown = g || f ? out : orig;
+        this.sel = shown; this.needsPresent = true;
+      },
+      commit: () => {
+        this.sel = orig; free();
+        if (shown === out) this.setSelection(out, 'Refine selection edge'); else freeTarget(gl, out);
+      },
+      cancel: () => { this.sel = orig; free(); freeTarget(gl, out); this.needsPresent = true; },
+    };
   }
   /** new layer holding the selected pixels of the active layer */
   copySelectionToLayer(): Layer | null {
@@ -1158,6 +1222,57 @@ export class Engine {
     gl.disable(gl.BLEND);
     this.markDirty();
   }
+  private meshVao: WebGLVertexArrayObject | null = null;
+  private meshBuf: WebGLBuffer | null = null;
+  private meshIdx: WebGLBuffer | null = null;
+  private meshN = 0;
+  /**
+   * Clear dst and draw src through a deformation mesh: verts = (n+1)² × [docX, docY, u, v], row-major.
+   * minScale/maxScale: local magnification range, used to choose the filter.
+   */
+  renderMesh(dst: Target, src: Target, verts: Float32Array, n: number, filter: 'smooth' | 'sharp', minScale: number, keep?: Target | null) {
+    const gl = this.gl;
+    if (!this.meshVao) {
+      this.meshVao = gl.createVertexArray()!; this.meshBuf = gl.createBuffer()!; this.meshIdx = gl.createBuffer()!;
+      gl.bindVertexArray(this.meshVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.meshBuf);
+      gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+      gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.meshIdx);
+      gl.bindVertexArray(null);
+    }
+    gl.bindVertexArray(this.meshVao);
+    if (this.meshN !== n) {
+      const idx = new Uint16Array(n * n * 6); let k = 0;
+      for (let j = 0; j < n; j++) for (let i = 0; i < n; i++) {
+        const a = j * (n + 1) + i, b = a + 1, c = a + n + 1, d = c + 1;
+        idx.set([a, b, c, b, d, c], k); k += 6;
+      }
+      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+      this.meshN = n;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.meshBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.DYNAMIC_DRAW);
+    bindTarget(gl, dst);
+    gl.disable(gl.BLEND);
+    if (keep) {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, keep.fb); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fb);
+      gl.blitFramebuffer(0, 0, this.w, this.h, 0, 0, this.w, this.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      bindTarget(gl, dst);
+    } else { gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT); }
+    // overlapping folds of a warp would double-cover: draw with premultiplied "over" so they stack like paper
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    const mode = filter === 'sharp' ? 0 : minScale < 0.999 ? 1 : 2;
+    gl.bindTexture(gl.TEXTURE_2D, src.tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mode === 0 ? gl.NEAREST : mode === 1 ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, mode === 0 ? gl.NEAREST : gl.LINEAR);
+    this.pMesh.use().tex('uSrc', 0, src.tex).f('uSrcSize', src.w, src.h).f('uDocSize', this.w, this.h).i('uFilter', mode);
+    gl.drawElements(gl.TRIANGLES, n * n * 6, gl.UNSIGNED_SHORT, 0);
+    gl.disable(gl.BLEND);
+    gl.bindVertexArray(null);
+    this.markDirty();
+  }
+
   /** add a layer above the active one without recording history (a pending transform) */
   addLayerRaw(name: string): Layer | null {
     if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;

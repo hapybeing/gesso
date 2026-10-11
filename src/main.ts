@@ -11,7 +11,7 @@ import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } 
 import { readGesso, writeGesso } from './gessofile';
 import { pngEncode } from './workerclient';
 import { ShapeTool } from './shapetool';
-import { TransformTool } from './transformtool';
+import { TransformTool, homography } from './transformtool';
 import { SelectTool, SelKind } from './selecttool';
 import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
@@ -472,6 +472,7 @@ class App {
     $('#bSelect').classList.add('on');
   }
   exitSelectTool() {
+    if (this.edgeAdj) this.closeEdgeAdjust(false);
     this.selTool?.closePoly();
     if (this.input.grab === this.selTool) this.input.grab = null;
     this.selTool = null;
@@ -479,10 +480,39 @@ class App {
     $('#bSelect')?.classList.remove('on');
     this.ovDirty = true;
   }
+  edgeAdj: { api: NonNullable<ReturnType<Engine['beginEdgeAdjust']>>; grow: number; feather: number; raf: number } | null = null;
+  openEdgeAdjust() {
+    const api = this.engine.beginEdgeAdjust(); if (!api) return;
+    this.edgeAdj = { api, grow: 0, feather: 0, raf: 0 };
+    this.renderSelBar();
+  }
+  closeEdgeAdjust(commit: boolean) {
+    const a = this.edgeAdj; if (!a) return;
+    cancelAnimationFrame(a.raf); this.edgeAdj = null;
+    if (commit) a.api.commit(); else a.api.cancel();
+    this.renderSelBar();
+  }
+  renderEdgeBar(bar: HTMLElement) {
+    const a = this.edgeAdj!;
+    const big = Math.max(this.engine.w, this.engine.h);
+    const maxGrow = Math.round(Math.min(400, Math.max(40, big / 20)));
+    const upd = () => { cancelAnimationFrame(a.raf); a.raf = requestAnimationFrame(() => a.api.preview(a.grow, a.feather)); };
+    const slider = (label: string, min: number, max: number, get: () => number, set: (v: number) => void, fmt: (v: number) => string) => {
+      const out = h('b', { class: 'edge-val' }, fmt(get()));
+      const r = h('input', { type: 'range', min: String(min), max: String(max), step: '1', value: String(get()), class: 'edge-range', 'aria-label': label }) as HTMLInputElement;
+      r.oninput = () => { set(+r.value); out.textContent = fmt(+r.value); upd(); };
+      return h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, label), r, out);
+    };
+    bar.append(
+      slider('Shrink / Grow', -maxGrow, maxGrow, () => a.grow, (v) => { a.grow = v; }, (v) => (v > 0 ? '+' : '') + v + ' px'),
+      slider('Feather', 0, Math.round(maxGrow / 2), () => a.feather, (v) => { a.feather = v; }, (v) => v + ' px'),
+      h('div', { class: 'chips' }, h('button', { class: 'btn ghost small', onClick: () => this.closeEdgeAdjust(false) }, 'Cancel'), h('button', { class: 'btn small', onClick: () => this.closeEdgeAdjust(true) }, 'Apply')));
+  }
   renderSelBar() {
     const bar = this.selBar, st = this.selTool; if (!bar || !st) return;
     const e = this.engine;
     bar.innerHTML = '';
+    if (this.edgeAdj) { this.renderEdgeBar(bar); return; }
     const chip = (label: string, on: boolean, fn: () => void, disabled = false) => h('button', { class: 'chip' + (on ? ' on' : ''), disabled, onClick: () => { fn(); this.renderSelBar(); } }, label);
     const kinds: [SelKind, string][] = [['auto', 'Automatic'], ['free', 'Freehand'], ['rect', 'Rectangle'], ['ellipse', 'Ellipse']];
     bar.append(h('div', { class: 'chips' }, ...kinds.map(([k, l]) => chip(l, st.kind === k, () => { st.cancelPoly(); st.kind = k; this.state.settings.selKind = k; this.save(); }))));
@@ -492,7 +522,7 @@ class App {
     const has = !!e.sel;
     bar.append(h('div', { class: 'chips' },
       chip('Invert', false, () => e.invertSelection()),
-      chip('Feather', false, () => this.featherPrompt(), !has),
+      chip('Refine edge', false, () => this.openEdgeAdjust(), !has),
       chip('Copy & paste', false, () => { if (!e.copySelectionToLayer()) this.toast('Layer limit reached'); }, !has),
       chip('Fill', false, () => e.fillLayer(this.state.color), !has),
       chip('Clear', false, () => e.clearLayer(), !has),
@@ -500,12 +530,6 @@ class App {
       chip('Deselect', false, () => e.deselect(), !has),
       h('button', { class: 'btn small', onClick: () => this.exitSelectTool() }, 'Done')));
   }
-  async featherPrompt() {
-    const v = await ask('Feather selection', { input: '12', okLabel: 'Feather', body: 'Softens the selection edge. Radius in pixels:' });
-    const r = v ? parseFloat(v) : NaN;
-    if (r > 0) this.engine.featherSelection(Math.min(400, r));
-  }
-
   /** lift the selection (or the whole layer) into the transform box */
   async startLayerTransform() {
     this.settle(); this.closePop();
@@ -522,13 +546,13 @@ class App {
     const before = e.stashLayer(layer);
     const keep = outside;
     const init = { cx: bb.x + bb.w / 2, cy: bb.y + bb.h / 2, sx: 1, sy: 1, rot: 0 };
-    this.startTransform(layer, src, 'replace', (commit, mat) => {
+    this.startTransform(layer, src, 'replace', (commit, tool) => {
       if (commit) {
         e.history.beginGroup();
         e.recordReplace(layer, before, 'Transform');
         if (maskSrc) {
           const m = e.blankTarget();
-          e.renderTransformed(m, maskSrc, mat, 'smooth');
+          tool.renderTo(m, maskSrc, null, 'smooth');
           e.setSelection(m, 'Transform');
         }
         e.history.endGroup('Transform');
@@ -556,9 +580,10 @@ class App {
   }
 
   undo() {
+    if (this.edgeAdj) this.closeEdgeAdjust(false);
     if (this.shapes.active) { this.shapes.cancel(); this.toast('Undo shape'); return; }
     if (this.engine.stroking) return; const l = this.engine.history.undo(); this.toast(l ? 'Undo ' + l.toLowerCase() : 'Nothing to undo'); }
-  redo() { this.settle(); if (this.engine.stroking) return; const l = this.engine.history.redo(); this.toast(l ? 'Redo ' + l.toLowerCase() : 'Nothing to redo'); }
+  redo() { if (this.edgeAdj) this.closeEdgeAdjust(false); this.settle(); if (this.engine.stroking) return; const l = this.engine.history.redo(); this.toast(l ? 'Redo ' + l.toLowerCase() : 'Nothing to redo'); }
 
   eyedrop(x: number, y: number, done: boolean, sx: number, sy: number) {
     const c = this.engine.sample(x, y);
@@ -1143,13 +1168,13 @@ class App {
     });
   }
 
-  startTransform(layer: Layer, src: Target, mode: 'insert' | 'replace', finish: (commit: boolean, m: number[]) => void, init?: ConstructorParameters<typeof TransformTool>[5], keep: Target | null = null) {
+  startTransform(layer: Layer, src: Target, mode: 'insert' | 'replace', finish: (commit: boolean, tool: TransformTool) => void, init?: ConstructorParameters<typeof TransformTool>[5], keep: Target | null = null) {
     this.input.grab = this.xform = new TransformTool({
       engine: this.engine,
       overlayChanged: () => { this.ovDirty = true; },
       done: () => { this.input.grab = null; this.xform = null; this.ovDirty = true; },
       toast: (m) => this.toast(m),
-    }, layer, src, mode, (commit, m) => { finish(commit, m); this.engine.freeSource(src); }, init, keep);
+    }, layer, src, mode, (commit, tool) => { finish(commit, tool); this.engine.freeSource(src); }, init, keep);
     this.ovDirty = true;
   }
 
@@ -1236,4 +1261,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 (window as any).gesso = new App();
-(window as any).gessoTest = { loadClip, exportClip, selectFrames };
+(window as any).gessoTest = { loadClip, exportClip, selectFrames, homography };
