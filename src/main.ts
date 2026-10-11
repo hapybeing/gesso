@@ -6,6 +6,7 @@ import { pressureSection } from './pressureui';
 import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
+import { readGesso, writeGesso, encodePNG, unpremultiply } from './gessofile';
 import { RGB, HSV, hsvToRgb, rgbToHsv, toHex, fromHex } from './color';
 
 // ------------------------------------------------------------------ helpers
@@ -206,8 +207,71 @@ class App {
     if (n) { m.name = n; this.autosave.touch(); }
   }
 
-  importGessoFile() { this.toast('Import arrives with the .gesso format'); }
-  async exportGessoFile(_id: string) { this.toast('Export arrives with the .gesso format'); }
+  /** pick a .gesso (or OpenRaster .ora) file and add it to the gallery as a new artwork */
+  importGessoFile() {
+    const inp = h('input', { type: 'file', accept: '.gesso,.ora,application/zip,application/octet-stream' }) as HTMLInputElement;
+    inp.onchange = () => { const f = inp.files?.[0]; if (f) void this.importGessoBlob(f, f.name.replace(/\.(gesso|ora|zip)$/i, '')); };
+    inp.click();
+  }
+  async importGessoBlob(blob: Blob, name: string) {
+    this.toast('Opening ' + name + '…');
+    try {
+      const doc = await readGesso(blob, name);
+      if (!doc.w || !doc.h) throw new Error('File has no canvas size');
+      if (Math.max(doc.w, doc.h) > this.engine.maxTex) throw new Error(`Canvas ${doc.w}×${doc.h} is larger than this device supports (${this.engine.maxTex}px)`);
+      const layers = await Promise.all(doc.layers.map(async (l) => ({
+        props: l.props, x: l.offset?.x || 0, y: l.offset?.y || 0,
+        image: await createImageBitmap(new Blob([l.png as unknown as BlobPart], { type: 'image/png' }), { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }),
+      })));
+      await this.autosave.flush();
+      this.autosave.detach();
+      this.engine.loadDocument(doc.w, doc.h, doc.bg, doc.bgVisible, layers, doc.active);
+      layers.forEach((l) => l.image.close());
+      this.applyDocExtra(doc.extra || {});
+      const now = Date.now();
+      const meta: DocMeta = { id: newDocId(), name: doc.name, w: doc.w, h: doc.h, bg: doc.bg, bgVisible: doc.bgVisible, layers: [], active: doc.active, created: now, modified: now };
+      this.autosave.attach(meta, false);
+      localStorage.setItem('gesso.last', meta.id);
+      await this.autosave.flush();
+      this.thumbVersions.clear(); this.fit(); this.updateUndoButtons(); this.closeGallery();
+      this.toast('Imported ' + doc.name);
+    } catch (err) { this.toast('Could not open file: ' + (err as Error).message); }
+  }
+
+  /** build the .gesso file for the open artwork */
+  async buildGesso(): Promise<Blob> {
+    const e = this.engine;
+    const layers = [];
+    for (const l of [...e.layers]) {
+      const px = unpremultiply(await e.readLayerAsync(l));
+      layers.push({ props: l.props(), png: await encodePNG(px, e.w, e.h) });
+    }
+    const merged = await encodePNG(new Uint8Array(e.compositePixels(e.bgVisible).buffer), e.w, e.h);
+    const tc = e.compositeThumbnail(256);
+    const tpx = tc.getContext('2d')!.getImageData(0, 0, tc.width, tc.height).data;
+    const thumb = await encodePNG(new Uint8Array(tpx.buffer), tc.width, tc.height);
+    return writeGesso({ name: this.autosave.meta?.name || 'Untitled', w: e.w, h: e.h, bg: e.bg, bgVisible: e.bgVisible, active: e.active, layers, merged, thumb, extra: this.docExtra() });
+  }
+
+  async exportGessoFile(id?: string) {
+    if (id && id !== this.autosave.docId && !(await this.openDoc(id, true))) return;
+    this.toast('Packing .gesso file…');
+    try {
+      const blob = await this.buildGesso();
+      const base = (this.autosave.meta?.name || 'artwork').replace(/[\\/:*?"<>|]+/g, '').trim() || 'artwork';
+      this.download(blob, base + '.gesso', 'application/octet-stream');
+    } catch (err) { this.toast('Export failed: ' + (err as Error).message); }
+  }
+
+  download(blob: Blob, name: string, type: string) {
+    const file = new File([blob], name, { type });
+    const a = h('a', { href: URL.createObjectURL(blob), download: name });
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+    const nav = navigator as Navigator & { canShare?: (d: ShareData) => boolean };
+    this.toast('Saved ' + name, nav.canShare?.({ files: [file] }) ? { label: 'Share', fn: () => navigator.share({ files: [file], title: name }).catch(() => {}) } : undefined);
+  }
+
 
   fatal(msg: string) {
     document.body.append(h('div', { class: 'fatal' }, h('h2', {}, 'Gesso can\'t start'), h('p', {}, msg), h('p', {}, 'Gesso needs WebGL2. In Brave, check Settings → System → "Use graphics acceleration".')));
@@ -682,6 +746,8 @@ class App {
       item('Insert a photo', () => this.importPhoto()),
       item('Export PNG', () => this.exportPNG()),
       item('Export PNG (transparent)', () => this.exportPNG(false)),
+      item('Export .gesso file', () => void this.exportGessoFile(), 'layers kept · opens in Krita as .ora'),
+      item('Import .gesso / .ora…', () => this.importGessoFile()),
       item('Fit canvas to screen', () => this.fit()),
       item('Full screen', () => document.documentElement.requestFullscreen?.().catch(() => {})),
       this.installEvt ? item('Install Gesso app', () => this.installEvt.prompt()) : null,

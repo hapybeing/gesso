@@ -18,7 +18,7 @@ Known debt: full-canvas textures rather than tiles.
 
 ## M2 — Workflow
 - [x] IndexedDB autosave (debounced, per-layer dirty layers, bit-exact) + Gallery (thumbnails, new/duplicate/delete/rename, canvas presets); opens to last artwork; beforeunload nag removed
-- [ ] Native .gesso format (zip: manifest.json + layer PNGs) save/load; PSD-free
+- [x] Native .gesso format (zip: manifest.json + layer PNGs, also a valid OpenRaster file) export/import; .ora import
 - [ ] Image import as layer, with transform
 - [ ] QuickShape (hold at stroke end: line, ellipse, rectangle, polyline; edit handles)
 - [ ] Selection: freehand, rectangle, ellipse, magic wand; mask-aware painting; invert/feather/clear

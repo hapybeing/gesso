@@ -832,13 +832,22 @@ export class Engine {
   }
 
   /** replace the whole document (no undo history) */
-  loadDocument(w: number, h: number, bg: [number, number, number], bgVisible: boolean, layers: { props: LayerProps; data: Uint8Array | null }[], active: number) {
+  loadDocument(w: number, h: number, bg: [number, number, number], bgVisible: boolean,
+    layers: { props: LayerProps; data?: Uint8Array | null; image?: ImageBitmap; x?: number; y?: number }[], active: number) {
     this.newDocument(w, h, bg);
     const gl = this.gl;
     freeTarget(gl, this.layers[0].target);
-    this.layers = layers.map(({ props, data }) => {
+    this.layers = layers.map(({ props, data, image, x = 0, y = 0 }) => {
       const t = makeTarget(gl, w, h);
-      if (data && data.byteLength === w * h * 4) {
+      if (image) {
+        // straight-alpha image -> premultiplied layer, placed at its offset
+        const src = textureFromCanvas(gl, image, false, false);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        bindTarget(gl, t); gl.disable(gl.BLEND);
+        this.pPremul.use().tex('uSrc', 0, src).f('uRect', x / w, y / h, image.width / w, image.height / h);
+        this.drawQuad();
+        gl.deleteTexture(src);
+      } else if (data && data.byteLength === w * h * 4) {
         gl.bindTexture(gl.TEXTURE_2D, t.tex);
         gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
         gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
