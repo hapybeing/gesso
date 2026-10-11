@@ -7,6 +7,10 @@ import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
 import { readGesso, writeGesso, encodePNG, unpremultiply } from './gessofile';
+import { ShapeTool } from './shapetool';
+import type { Shape } from './quickshape';
+import { dabsAlong } from './stroke';
+import type { Dab } from './engine';
 import { RGB, HSV, hsvToRgb, rgbToHsv, toHex, fromHex } from './color';
 
 // ------------------------------------------------------------------ helpers
@@ -55,7 +59,7 @@ const ICON = {
 };
 
 // ------------------------------------------------------------------ persisted state
-interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; }
+interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; }
 interface State {
   toolBrush: Record<Tool, string>;
   color: RGB; recent: string[];
@@ -65,7 +69,7 @@ interface State {
 const DEFAULT_STATE: State = {
   toolBrush: { brush: 'ink-studio', eraser: 'air-hard', smudge: 'smudge-soft' },
   color: [0.12, 0.11, 0.1], recent: [],
-  settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true },
+  settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true, snapShapes: true, snapDelay: 500 },
   overrides: {},
 };
 const prefs = {
@@ -104,6 +108,12 @@ class App {
   installEvt: any = null;
   autosave: Autosave;
   gallery: Gallery | null = null;
+  ov: HTMLCanvasElement;
+  ovDirty = true;
+  shapes: ShapeTool;
+  /** an on-canvas handle grabbed by the current pointer */
+  capture: { kind: 'shape'; i: number } | null = null;
+  strokeBrush: Brush | null = null;
 
   constructor() {
     this.canvas = $('#view') as HTMLCanvasElement;
@@ -116,9 +126,22 @@ class App {
       strokeCancel: () => { this.engine.cancelStroke(); this.builder = null; },
       undo: () => this.undo(), redo: () => this.redo(),
       eyedrop: (x, y, done, sx, sy) => this.eyedrop(x, y, done, sx, sy),
-      viewChanged: () => { this.engine.needsPresent = true; },
+      viewChanged: () => { this.engine.needsPresent = true; this.ovDirty = true; },
       eyedropArmed: () => this.eyedropOnce,
+      captureAt: (sx, sy) => this.captureAt(sx, sy),
+      secondaryTouch: () => this.shapes.secondary(),
     });
+    this.ov = h('canvas', { id: 'ov' }) as HTMLCanvasElement;
+    this.canvas.after(this.ov);
+    this.shapes = new ShapeTool({
+      engine: this.engine,
+      dabsFor: (sh) => this.shapeDabs(sh),
+      freehandDabs: () => this.expand(this.lastBuilder ? this.lastBuilder.finishedDabs() : []),
+      overlayChanged: () => { this.ovDirty = true; },
+      committed: () => this.pushRecent(),
+    });
+    this.shapes.delay = this.state.settings.snapDelay;
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') { this.settle(); void this.autosave.flush(); } });
     this.input.stylusMode = this.state.settings.stylus;
     this.curve.set(...this.state.settings.curve);
     this.engine.history.maxSteps = 250;
@@ -133,7 +156,7 @@ class App {
     this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); };
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installEvt = e; });
     this.keys();
-    const loop = () => { this.engine.render(); requestAnimationFrame(loop); };
+    const loop = () => { this.engine.render(); if (this.ovDirty) this.drawOverlay(); requestAnimationFrame(loop); };
     requestAnimationFrame(loop);
     const q = new URLSearchParams(location.search);
     if (q.get('w') && q.get('h')) this.newCanvas(+q.get('w')!, +q.get('h')!);
@@ -176,6 +199,7 @@ class App {
   applyDocExtra(_x: Record<string, unknown>) { /* set by features */ }
 
   showGallery() {
+    this.settle();
     this.closePop();
     void this.autosave.flush().then(() => {
       this.closeGallery();
@@ -291,8 +315,20 @@ class App {
   save() { prefs.save(this.state); }
 
   // ---------------------------------------------------------------- strokes
+  /** finish any pending on-canvas edit (shape handles) before another action */
+  settle() { this.shapes.commit(); }
+
+  captureAt(sx: number, sy: number) {
+    const i = this.shapes.handleAt(sx, sy);
+    if (i >= 0) { this.capture = { kind: 'shape', i }; return true; }
+    return false;
+  }
+
+  lastBuilder: StrokeBuilder | null = null;
   strokeStart(s: Sample, _type: string, eraserEnd = false) {
     this.closePop();
+    if (this.capture?.kind === 'shape') { this.shapes.beginDrag(this.capture.i); return true; }
+    this.settle();
     const layer = this.engine.activeLayer;
     if (!layer) return false;
     if (!layer.visible) { this.toast('This layer is hidden'); return false; }
@@ -300,29 +336,64 @@ class App {
     this.strokeTool = tool;
     const brush = this.brushFor(tool);
     if (!this.engine.beginStroke(tool, brush, this.state.color)) return false;
+    this.strokeBrush = brush;
     const preset = BRUSHES.find((b) => b.id === brush.id);
     this.builder = new StrokeBuilder(brush, { curve: this.curve, viewScale: this.engine.view.scale, sizeRatio: preset ? brush.size / preset.size : 1 });
-    this.engine.addDabs(this.builder.start(s));
+    this.lastBuilder = this.builder;
+    this.engine.addDabs(this.expand(this.builder.start(s)));
+    const b = this.builder;
+    if (tool !== 'smudge' && this.state.settings.snapShapes) this.shapes.strokeBegan(() => b.raw);
     return true;
   }
   strokeMove(samples: Sample[]) {
+    const last = samples[samples.length - 1];
+    if (this.shapes.dragging) { this.shapes.dragTo(last); return; }
+    if (this.shapes.phase === 'hold') { this.shapes.holdMove(last); return; }
     if (!this.builder) return;
-    const dabs = [];
+    const dabs: Dab[] = [];
     for (const s of samples) dabs.push(...this.builder.add(s));
-    this.engine.addDabs(dabs);
+    this.engine.addDabs(this.expand(dabs));
+    if (this.strokeTool !== 'smudge' && this.state.settings.snapShapes) { const sp = this.engine.docToScreen(last.x, last.y); this.shapes.pen(sp.x, sp.y); }
   }
   strokeEnd() {
+    if (this.capture) { this.capture = null; this.shapes.endDrag(); return; }
+    if (this.shapes.phase === 'hold') { this.shapes.holdEnd(); this.builder = null; return; }
+    this.shapes.strokeEnded();
     if (!this.builder) return;
     const { added, full } = this.builder.finish();
-    this.engine.addDabs(added);
-    if (full) this.engine.redrawStroke(full);
+    this.engine.addDabs(this.expand(added));
+    if (full) this.engine.redrawStroke(this.expand(full));
     this.engine.endStroke();
     this.builder = null;
     this.pushRecent();
   }
 
-  undo() { if (this.engine.stroking) return; const l = this.engine.history.undo(); this.toast(l ? 'Undo ' + l.toLowerCase() : 'Nothing to undo'); }
-  redo() { if (this.engine.stroking) return; const l = this.engine.history.redo(); this.toast(l ? 'Redo ' + l.toLowerCase() : 'Nothing to redo'); }
+  /** symmetry hook: identity until a guide is active */
+  expand(dabs: Dab[]): Dab[] { return dabs; }
+
+  shapeDabs(sh: Shape): Dab[] {
+    const b = this.strokeBrush || this.brushFor(this.tool);
+    const raw = this.lastBuilder?.raw || [];
+    const ps = raw.map((r) => r.p).sort((x, y) => x - y);
+    const p = ps.length ? ps[Math.floor(ps.length * 0.6)] : 1;
+    const preset = BRUSHES.find((x) => x.id === b.id);
+    return this.expand(dabsAlong(b, sh.path(), p, { curve: this.curve, viewScale: this.engine.view.scale, sizeRatio: preset ? b.size / preset.size : 1 }, sh.closed));
+  }
+
+  drawOverlay() {
+    this.ovDirty = false;
+    const c = this.ov, g = c.getContext('2d')!;
+    const dpr = c.width / (c.clientWidth || 1);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, c.width, c.height);
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.shapes.drawOverlay(g);
+  }
+
+  undo() {
+    if (this.shapes.active) { this.shapes.cancel(); this.toast('Undo shape'); return; }
+    if (this.engine.stroking) return; const l = this.engine.history.undo(); this.toast(l ? 'Undo ' + l.toLowerCase() : 'Nothing to undo'); }
+  redo() { this.settle(); if (this.engine.stroking) return; const l = this.engine.history.redo(); this.toast(l ? 'Redo ' + l.toLowerCase() : 'Nothing to redo'); }
 
   eyedrop(x: number, y: number, done: boolean, sx: number, sy: number) {
     const c = this.engine.sample(x, y);
@@ -372,6 +443,7 @@ class App {
     const oldW = c.clientWidth;
     c.width = Math.round(c.clientWidth * dpr);
     c.height = Math.round(c.clientHeight * dpr);
+    if (this.ov) { this.ov.width = c.width; this.ov.height = c.height; this.ovDirty = true; }
     if (oldW) this.engine.needsPresent = true;
   }
 
@@ -458,6 +530,7 @@ class App {
   }
 
   pickTool(t: Tool, silent = false) {
+    this.settle();
     const same = this.tool === t;
     this.tool = t;
     for (const [id, tt] of [['tBrush', 'brush'], ['tSmudge', 'smudge'], ['tEraser', 'eraser']] as const) $('#' + id).classList.toggle('on', tt === t);
@@ -467,6 +540,7 @@ class App {
   }
 
   togglePop(kind: string, render: (this: App, el: HTMLElement) => void, forceOpen?: boolean) {
+    this.settle();
     if (this.popKind === kind && !forceOpen) { this.closePop(); return; }
     this.closePop();
     const el = h('div', { class: 'pop pop-' + kind.split('-')[0] });
@@ -813,6 +887,17 @@ class App {
     s.body.append(
       h('section', {}, h('h4', {}, 'Touch & stylus'), seg, h('p', { class: 'muted' }, 'Palm rejection: in Auto, once Gesso sees your stylus, fingers only pan, zoom, rotate, undo and pick colours. Large contact patches (a resting palm) are always ignored.')),
       pres,
+      (() => {
+        const on = h('input', { type: 'checkbox' }) as HTMLInputElement; on.checked = st.snapShapes;
+        on.onchange = () => { st.snapShapes = on.checked; this.save(); };
+        const d = h('input', { type: 'range', min: 250, max: 1200, step: 50, value: st.snapDelay }) as HTMLInputElement;
+        const dv = h('span', { class: 'sv' }, st.snapDelay + ' ms');
+        d.oninput = () => { st.snapDelay = +d.value; this.shapes.delay = st.snapDelay; dv.textContent = d.value + ' ms'; this.save(); };
+        return h('section', {}, h('h4', {}, 'Shape snapping'),
+          h('label', { class: 'srow' }, h('span', {}, 'Hold at the end of a stroke to snap it to a shape'), on),
+          h('label', { class: 'srow' }, h('span', {}, 'Hold time'), d, dv),
+          h('p', { class: 'muted' }, 'Lines, arcs, polylines, ellipses, circles, rectangles and polygons. Keep holding and move to resize; touch the screen with a finger for a perfect circle, square or 15° line.'));
+      })(),
       h('section', {}, h('h4', {}, 'Layout'), h('label', { class: 'srow' }, h('span', {}, 'Sidebar on the right'), rail)),
     );
   }
@@ -821,7 +906,8 @@ class App {
     const s = this.sheet('Gestures');
     const rows: [string, string][] = [
       ['Two-finger tap', 'Undo'], ['Three-finger tap', 'Redo'], ['Pinch / twist with two fingers', 'Zoom, pan and rotate the canvas'],
-      ['Touch & hold', 'Eyedropper (lift to pick)'], ['Tap the active brush', 'Open Brush studio'],
+      ['Touch & hold', 'Eyedropper (lift to pick)'], ['Two-finger touch & hold', 'Undo repeatedly'],
+      ['Hold the pen still at the end of a stroke', 'Snap to a line, arc, ellipse, rectangle or polygon; add a finger for a perfect one'], ['Tap the active brush', 'Open Brush studio'],
       ['Tap the canvas with a panel open', 'Close the panel'],
       ['Keyboard', 'Ctrl+Z / Ctrl+Shift+Z, B E S tools, [ ] size, Space+drag pan, wheel zoom'],
     ];

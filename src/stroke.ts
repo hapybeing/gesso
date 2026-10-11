@@ -251,6 +251,9 @@ export class StrokeBuilder {
     return out.map((d) => ({ ...d, r: Math.max(0.25, d.r * (0.1 + 0.9 * smooth(Math.min(1, (total - d.dist) / te)))) }));
   }
 
+  /** finish (if not yet) and return the complete, tapered dab list */
+  finishedDabs(): Dab[] { const { full } = this.finish(); return full || this.all; }
+
   /** every dab of the stroke (for symmetry re-expansion / QuickShape replacement) */
   get dabs(): Dab[] { return this.all; }
 }

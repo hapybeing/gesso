@@ -11,6 +11,10 @@ export interface InputHooks {
   eyedrop(docX: number, docY: number, done: boolean, sx: number, sy: number): void;
   viewChanged(): void;
   eyedropArmed(): boolean; // one-shot eyedropper button
+  /** an on-canvas handle wants this pointer (shape handles, guides, transform box): route it as a "draw" */
+  captureAt(sx: number, sy: number, pointerType: string): boolean;
+  /** a finger touched while the pen is drawing (used as a modifier, e.g. perfect shapes) */
+  secondaryTouch(): void;
 }
 
 export type StylusMode = 'auto' | 'pen' | 'any';
@@ -79,9 +83,11 @@ export class Input {
     e.preventDefault();
     const l = this.local(e);
     try { this.el.setPointerCapture(e.pointerId); } catch { /* synthetic events */ }
+    if (this.drawId === null && !this.gesture && this.touches.size === 0 && this.hooks.captureAt(l.x, l.y, e.pointerType)) { this.beginDraw(e); return; }
     if (e.pointerType === 'touch') {
       // palm: very large contact patch
-      if (e.width * e.height > 4200 || (this.drawId !== null && this.drawType === 'pen')) { this.ignored.add(e.pointerId); return; }
+      if (e.width * e.height > 4200) { this.ignored.add(e.pointerId); return; }
+      if (this.drawId !== null && this.drawType === 'pen') { this.ignored.add(e.pointerId); this.hooks.secondaryTouch(); return; }
       this.touches.set(e.pointerId, { x: l.x, y: l.y, sx: l.x, sy: l.y });
       if (this.touches.size === 1) {
         if (this.hooks.eyedropArmed()) { this.startEyedrop(e.pointerId, l.x, l.y); return; }

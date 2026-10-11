@@ -490,7 +490,13 @@ export class Engine {
     gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
     c.dabs = dabs;
     this.drawDabs(dabs, c.brush);
-    if (c.bbox) this.markDirty(this.padRect(c.bbox));
+    // the new dab set can be larger or smaller than before: dirty the union, keep the new bbox for the bake
+    const old = c.bbox;
+    let bb: Rect | null = null;
+    for (const d of dabs) bb = unionRect(bb, this.dabRect(d));
+    c.bbox = bb;
+    const u = old && bb ? unionRect(old, bb) : old || bb;
+    if (u) this.markDirty(this.padRect(u));
   }
 
   private padRect(r: Rect) {
