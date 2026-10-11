@@ -138,3 +138,4 @@ Whole suite green in four groups (`test/all.sh 1`…`4`): every test exits 0 wit
 ## Text + reference
 - text: T button / menu; tap places, textarea live preview, fonts Sans/Serif/Mono (system) + bundled OFL Caveat (74 KB woff2, Latin subset) and Bebas Neue (13 KB), size/line/spacing, align keeps the box, bold/italic, drag on canvas to move, Done = one undo step, layer named from text; stays editable while unpainted (Layers -> Edit text), edit undo/redo swaps specs (refinement: first cut lost editability after undoing an edit); persisted via props (autosave, .gesso manifest)
 - reference: floating draggable/resizable window, Canvas mode (live async thumbnail, refreshed when versions change, 400 ms poll) or Image mode (drag/pinch/wheel zoom, double-tap fit), Pick colour; position remembered
+- R4 note: wet.cjs passed alone (exit 0) but failed once at the end of group 7, probably timing under emulator load. Watch for flakiness.
