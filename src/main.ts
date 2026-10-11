@@ -8,6 +8,9 @@ import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
 import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
+import { Animator, AnimState } from './animation';
+import { exportSheet, exportAnimation } from './animexport';
+import { GifSession, buildPalette } from './gif';
 import { readGesso, writeGesso } from './gessofile';
 import { pngEncode } from './workerclient';
 import { ShapeTool } from './shapetool';
@@ -51,6 +54,7 @@ const ICON = {
   gallery: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
   select: '<path d="M4 8V5.5A1.5 1.5 0 015.5 4H8M12 4h2M18 4h.5A1.5 1.5 0 0120 5.5V8M20 12v2M20 18v.5a1.5 1.5 0 01-1.5 1.5H16M12 20h-2M6 20h-.5A1.5 1.5 0 014 18.5V16M4 12v-2"/>',
   transform: '<path d="M12 3v18M3 12h18"/><path d="M9.5 5.5L12 3l2.5 2.5M9.5 18.5L12 21l2.5-2.5M5.5 9.5L3 12l2.5 2.5M18.5 9.5L21 12l-2.5 2.5"/>',
+  film: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/>',
   symmetry: '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 6.5C5.5 7.5 4 10 4 12.5S6 18 9 17.5z"/><path d="M15 6.5c3.5 1 5 3.5 5 6s-2 5.5-5 5z"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
 };
@@ -118,6 +122,7 @@ class App {
   strokeBrush: Brush | null = null;
   tl: TimelapseRecorder;
   tlView: TimelapseView | null = null;
+  anim!: Animator;
 
   constructor() {
     this.canvas = $('#view') as HTMLCanvasElement;
@@ -154,12 +159,21 @@ class App {
     this.buildUI();
     this.resize();
     window.addEventListener('resize', () => this.resize());
-    this.engine.onLayersChanged = () => { if (this.popKind === 'layers') this.renderLayers(); this.scheduleThumbs(); };
+    this.engine.onLayersChanged = () => { if (this.anim?.on) this.anim.apply(); if (this.popKind === 'layers') this.renderLayers(); this.scheduleThumbs(); };
     this.autosave = new Autosave(this.engine);
     this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
     this.autosave.extra = () => this.docExtra();
     this.autosave.blocked = () => !!this.xform || this.shapes.active;
+    this.anim = new Animator({
+      engine: this.engine,
+      toast: (m) => this.toast(m),
+      changed: () => { this.autosave.touch(); $('#bAnim')?.classList.toggle('on', this.anim.on); },
+      openExport: () => this.showAnimExport(),
+      layerLimit: () => this.toast('Frame limit reached for this canvas size'),
+      layout: () => this.fit(),
+    });
     this.tl = new TimelapseRecorder(this.engine);
+    this.tl.list = () => this.anim.captureList();
     this.tl.blocked = () => !!this.xform || this.shapes.active;
     this.autosave.onAttach = (meta, clean) => {
       const x = (meta.extra?.timelapse || {}) as { on?: boolean };
@@ -216,8 +230,10 @@ class App {
   }
 
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym }, timelapse: { on: this.tl.enabled } }; }
+  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym }, timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st } }; }
   applyDocExtra(x: Record<string, unknown>) {
+    this.anim.load(x.anim as Partial<AnimState> | undefined);
+    $('#bAnim')?.classList.toggle('on', this.anim.on);
     const s = x.symmetry as Partial<Symmetry> | undefined;
     this.sym = { ...defaultSymmetry(this.engine.w, this.engine.h), ...(s || {}) };
     this.updateSymButton(); if (this.symBar) this.renderSymBar(); this.ovDirty = true;
@@ -360,6 +376,8 @@ class App {
   lastBuilder: StrokeBuilder | null = null;
   strokeStart(s: Sample, _type: string, eraserEnd = false) {
     this.closePop();
+    if (this.anim.playing) this.anim.stop();
+    this.anim.closePop();
     if (this.capture?.kind === 'shape') { this.shapes.beginDrag(this.capture.i); return true; }
     if (this.capture) return true; // guide handle drag
     this.settle();
@@ -625,8 +643,10 @@ class App {
   fit() {
     const cw = this.canvas.clientWidth, ch = this.canvas.clientHeight;
     const e = this.engine;
-    const s = Math.min((cw - 40) / e.w, (ch - 120) / e.h);
-    e.view = { scale: s, rot: 0, x: (cw - e.w * s) / 2, y: (ch - e.h * s) / 2 + 20 };
+    // leave room for the top bar, and for the timeline when animating
+    const top = 70, bottom = this.anim?.on ? 140 : 50;
+    const s = Math.min((cw - 40) / e.w, (ch - top - bottom) / e.h);
+    e.view = { scale: s, rot: 0, x: (cw - e.w * s) / 2, y: top + (ch - top - bottom - e.h * s) / 2 };
     e.needsPresent = true;
   }
   resize() {
@@ -658,6 +678,7 @@ class App {
       tb('tBrush', ICON.brush, 'Paint', () => this.pickTool('brush')),
       tb('tSmudge', ICON.smudge, 'Smudge', () => this.pickTool('smudge')),
       tb('tEraser', ICON.eraser, 'Erase', () => this.pickTool('eraser')),
+      tb('bAnim', ICON.film, 'Animation', () => { this.closePop(); this.anim.toggle(); $('#bAnim').classList.toggle('on', this.anim.on); }),
       tb('bSym', ICON.symmetry, 'Symmetry', () => this.toggleSymBar()),
       tb('bLayers', ICON.layers, 'Layers', () => this.togglePop('layers', this.renderLayers)),
       h('button', { id: 'bColor', class: 'swatch', title: 'Colour', 'aria-label': 'Colour', onClick: () => this.togglePop('color', this.renderColor) }),
@@ -1016,6 +1037,8 @@ class App {
       item('Insert a photo', () => this.importPhoto(), 'move · scale · rotate'),
       item('Export PNG', () => this.exportPNG()),
       item('Export PNG (transparent)', () => this.exportPNG(false)),
+      item(this.anim.on ? 'Animation: on' : 'Animation', () => { this.anim.toggle(); $('#bAnim').classList.toggle('on', this.anim.on); }, 'frames, onion skin, playback'),
+      this.anim.on ? item('Export animation…', () => this.showAnimExport(), 'GIF · MP4 · WebM · PNG frames') : null,
       item('Time-lapse', () => this.openTimelapse(), this.tl.enabled ? `${this.tl.frames} steps recorded` : 'recording paused'),
       item('Export .gesso file', () => void this.exportGessoFile(), 'layers kept · opens in Krita as .ora'),
       item('Import .gesso / .ora…', () => this.importGessoFile()),
@@ -1025,6 +1048,12 @@ class App {
       item('Settings', () => this.showSettings()),
       item('Gestures & help', () => this.showHelp()),
     ].filter(Boolean) as HTMLElement[]);
+  }
+
+  showAnimExport() {
+    this.settle(); this.anim.stop();
+    const { body, close } = this.sheet('Export animation');
+    exportSheet(body, this.anim, this.engine, (b, n, t) => this.download(b, n, t), (m) => this.toast(m), () => this.autosave.meta?.name || 'Gesso animation', close);
   }
 
   openTimelapse() {
@@ -1201,6 +1230,8 @@ class App {
       if (this.xform && (k === 'enter' || k === 'escape')) { e.preventDefault(); this.xform.finish(k === 'enter'); return; }
       if ((e.ctrlKey || e.metaKey) && k === 'z') { e.preventDefault(); e.shiftKey ? this.redo() : this.undo(); }
       else if ((e.ctrlKey || e.metaKey) && k === 'y') { e.preventDefault(); this.redo(); }
+      else if (this.anim.on && (k === ',' || k === '.')) { this.anim.stop(); this.anim.step(k === ',' ? -1 : 1); }
+      else if (this.anim.on && k === '/') this.anim.togglePlay();
       else if (k === 'b') this.pickTool('brush', true);
       else if (k === 'e') this.pickTool('eraser', true);
       else if (k === 's') this.pickTool('smudge', true);
@@ -1262,4 +1293,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 (window as any).gesso = new App();
-(window as any).gessoTest = { loadClip, exportClip, selectFrames, homography };
+(window as any).gessoTest = { loadClip, exportClip, selectFrames, homography, exportAnimation, GifSession, buildPalette };

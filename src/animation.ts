@@ -1,0 +1,413 @@
+// Animation assist: every visible layer is a frame (clipping layers ride with the frame below them). The compositor
+// gets a draw list per frame: background/foreground layers that show on every frame, onion skins (count before and
+// after, falloff, before/after tints), light-table pins, and the current frame. Playback follows the wall clock, so
+// holds and FPS stay exact even when a display frame is dropped.
+import type { Engine, Layer, DrawItem } from './engine';
+import { h } from './dom';
+
+export type PlayMode = 'loop' | 'pingpong' | 'oneshot';
+export interface AnimState {
+  on: boolean;
+  fps: number;
+  mode: PlayMode;
+  onionBefore: number; onionAfter: number; onionOpacity: number;
+  tint: 'off' | 'redgreen' | 'blueorange';
+  blendPrimary: boolean;
+  lightOpacity: number;
+  /** extra display frames per frame (uid → n) */
+  holds: Record<string, number>;
+  /** layers shown under ("bg") or over ("fg") every frame */
+  roles: Record<string, 'bg' | 'fg'>;
+  /** light-table pins: frames always shown faintly */
+  pins: string[];
+}
+export const defaultAnim = (): AnimState => ({ on: false, fps: 12, mode: 'loop', onionBefore: 2, onionAfter: 1, onionOpacity: 0.45, tint: 'redgreen', blendPrimary: false, lightOpacity: 0.3, holds: {}, roles: {}, pins: [] });
+const TINTS: Record<AnimState['tint'], [[number, number, number], [number, number, number]] | null> = {
+  off: null,
+  redgreen: [[0.86, 0.22, 0.2], [0.16, 0.6, 0.3]],
+  blueorange: [[0.2, 0.42, 0.9], [0.95, 0.55, 0.12]],
+};
+const PIN_TINT: [number, number, number] = [0.45, 0.45, 0.62];
+
+export interface Frame { base: Layer; clips: Layer[]; }
+export interface AnimHost {
+  engine: Engine;
+  toast(m: string): void;
+  changed(): void;              // anim settings changed (save soon)
+  openExport(): void;
+  layerLimit(): void;
+  layout(): void;               // the timeline appeared/disappeared: refit the canvas
+}
+
+export class Animator {
+  st: AnimState = defaultAnim();
+  playing = false;
+  private t0 = 0; private raf = 0; private shownTick = -1;
+  private lastFrame: string | null = null;
+  bar: HTMLElement | null = null;
+  private pop: HTMLElement | null = null;
+  private thumbs = new Map<string, { v: number; c: HTMLCanvasElement }>();
+  /** playback stats (tests / tuning) */
+  stats = { shown: 0, late: 0 };
+
+  constructor(private host: AnimHost) {}
+  get e() { return this.host.engine; }
+  get on() { return this.st.on; }
+
+  load(x: Partial<AnimState> | undefined) {
+    this.stop();
+    this.st = { ...defaultAnim(), ...(x || {}) };
+    this.thumbs.clear();
+    if (this.st.on) this.mount(); else this.unmount();
+    this.apply();
+  }
+  toggle(on = !this.st.on) {
+    this.st.on = on; this.stop();
+    if (on) this.mount(); else this.unmount();
+    this.apply(); this.host.changed(); this.host.layout();
+    if (on) this.host.toast(this.frames().length + ' frames · ' + this.st.fps + ' fps');
+  }
+
+  // ---------------------------------------------------------------- model
+  frames(): Frame[] {
+    const out: Frame[] = [];
+    for (const l of this.e.layers) {
+      if (this.st.roles[l.uid]) continue;
+      if (l.clip && out.length && l.visible) { out[out.length - 1].clips.push(l); continue; }
+      if (!l.visible || l.clip) continue;
+      out.push({ base: l, clips: [] });
+    }
+    return out;
+  }
+  hold(l: Layer) { return Math.max(0, this.st.holds[l.uid] || 0); }
+  /** index of the frame being edited (follows the active layer) */
+  current(fr = this.frames()): number {
+    if (!fr.length) return -1;
+    const a = this.e.activeLayer;
+    let i = fr.findIndex((f) => f.base === a || f.clips.includes(a));
+    if (i < 0 && this.lastFrame) i = fr.findIndex((f) => f.base.uid === this.lastFrame);
+    if (i < 0) i = 0;
+    this.lastFrame = fr[i].base.uid;
+    return i;
+  }
+  /** frame index per display tick for one cycle of the play mode */
+  ticks(fr = this.frames()): number[] {
+    const fwd: number[] = [];
+    fr.forEach((f, i) => { for (let k = 0; k <= this.hold(f.base); k++) fwd.push(i); });
+    if (this.st.mode !== 'pingpong' || fr.length < 3) return fwd;
+    const back: number[] = [];
+    for (let i = fr.length - 2; i >= 1; i--) for (let k = 0; k <= this.hold(fr[i].base); k++) back.push(i);
+    return fwd.concat(back);
+  }
+  /** runs of [frame, ticks] for export */
+  runs(fr = this.frames()): [number, number][] {
+    const out: [number, number][] = [];
+    for (const i of this.ticks(fr)) { const r = out[out.length - 1]; if (r && r[0] === i) r[1]++; else out.push([i, 1]); }
+    return out;
+  }
+
+  /** what the compositor draws for frame i */
+  list(i: number, onion: boolean, fr = this.frames()): DrawItem[] {
+    const items: DrawItem[] = [];
+    const roleItems = (role: 'bg' | 'fg') => {
+      let clipBase: Layer | null = null;
+      for (const l of this.e.layers) {
+        if (this.st.roles[l.uid] !== role) continue;
+        if (!l.clip) clipBase = l;
+        if (!l.visible || l.opacity <= 0) continue;
+        items.push({ layer: l, opacity: l.opacity, clipBase: l.clip && clipBase !== l ? clipBase : null });
+      }
+    };
+    const unit = (f: Frame, opacity: number, tint?: [number, number, number, number], keepBlend = false) => {
+      items.push({ layer: f.base, opacity: opacity * (keepBlend ? f.base.opacity : 1), blend: keepBlend ? f.base.blend : 0, tint });
+      for (const c of f.clips) items.push({ layer: c, opacity: opacity * (keepBlend ? c.opacity : 1), blend: keepBlend ? c.blend : 0, tint, clipBase: f.base });
+    };
+    roleItems('bg');
+    if (onion && i >= 0) {
+      const tints = TINTS[this.st.tint];
+      const amt = tints ? 0.8 : 0;
+      // light table pins (outside the onion range) underneath everything else
+      for (const uid of this.st.pins) {
+        const k = fr.findIndex((f) => f.base.uid === uid);
+        if (k < 0 || k === i || Math.abs(k - i) <= (k < i ? this.st.onionBefore : this.st.onionAfter)) continue;
+        unit(fr[k], this.st.lightOpacity, [...PIN_TINT, 0.7]);
+      }
+      const side = (n: number, dir: -1 | 1, tint: [number, number, number] | null) => {
+        for (let k = n; k >= 1; k--) {
+          const j = i + dir * k;
+          if (j < 0 || j >= fr.length) continue;
+          const fall = n > 1 ? 1 - (0.6 * (k - 1)) / (n - 1) : 1;
+          unit(fr[j], this.st.onionOpacity * fall, tint ? [...tint, amt] : undefined);
+        }
+      };
+      side(this.st.onionBefore, -1, tints ? tints[0] : null);
+      side(this.st.onionAfter, 1, tints ? tints[1] : null);
+    }
+    if (i >= 0 && fr[i]) unit(fr[i], onion && this.st.blendPrimary ? 0.65 : 1, undefined, true);
+    roleItems('fg');
+    return items;
+  }
+
+  /** point the compositor at the right draw list */
+  apply() {
+    const e = this.e;
+    if (!this.st.on) { if (e.drawList) { e.drawList = null; e.markDirty(); } return; }
+    const fr = this.frames();
+    const i = this.playing ? this.tickFrame(fr) : this.current(fr);
+    e.drawList = this.list(i, !this.playing, fr);
+    e.markDirty();
+    this.renderBar();
+  }
+  /** the current frame for the time-lapse (no onion skins) */
+  captureList(): DrawItem[] | undefined { if (!this.st.on) return undefined; const fr = this.frames(); return this.list(this.current(fr), false, fr); }
+
+  goto(i: number) {
+    const fr = this.frames(); if (!fr.length) return;
+    i = Math.max(0, Math.min(fr.length - 1, i));
+    this.e.active = this.e.layers.indexOf(fr[i].base);
+    this.lastFrame = fr[i].base.uid;
+    this.apply();
+    this.e.onLayersChanged();
+  }
+  step(d: number) {
+    const fr = this.frames(); if (!fr.length) return;
+    const n = fr.length; let i = this.current(fr) + d;
+    i = this.st.mode === 'oneshot' ? Math.max(0, Math.min(n - 1, i)) : ((i % n) + n) % n;
+    this.goto(i);
+  }
+
+  // ---------------------------------------------------------------- playback
+  private tickFrame(fr: Frame[]): number {
+    const t = this.ticks(fr);
+    if (!t.length) return -1;
+    const k = this.shownTick < 0 ? 0 : this.shownTick;
+    return t[Math.min(k, t.length - 1)];
+  }
+  play() {
+    if (this.playing || !this.st.on) return;
+    const fr = this.frames(); if (fr.length < 2) { this.host.toast('Add a second frame to play'); return; }
+    this.playing = true;
+    // start from the current frame
+    const t = this.ticks(fr), cur = this.current(fr);
+    const startTick = Math.max(0, t.indexOf(cur));
+    this.t0 = performance.now() - (startTick * 1000) / this.st.fps;
+    this.shownTick = -1;
+    this.stats = { shown: 0, late: 0 };
+    const loop = () => {
+      if (!this.playing) return;
+      this.raf = requestAnimationFrame(loop);
+      const ft = this.frames(), tt = this.ticks(ft);
+      let k = Math.floor(((performance.now() - this.t0) * this.st.fps) / 1000);
+      if (this.st.mode === 'oneshot' && k >= tt.length) { this.stop(); this.goto(tt[tt.length - 1]); return; }
+      k = k % tt.length;
+      if (k === this.shownTick) return;
+      if (this.shownTick >= 0 && k !== (this.shownTick + 1) % tt.length) this.stats.late++;
+      const prevFrame = this.shownTick >= 0 ? tt[this.shownTick] : -1;
+      this.shownTick = k;
+      if (tt[k] === prevFrame) return; // a hold: nothing to redraw
+      this.e.drawList = this.list(tt[k], false, ft);
+      this.e.markDirty();
+      this.stats.shown++;
+      this.highlight(tt[k]);
+    };
+    this.raf = requestAnimationFrame(loop);
+    this.renderBar();
+  }
+  stop() {
+    if (!this.playing) return;
+    this.playing = false; cancelAnimationFrame(this.raf);
+    this.shownTick = -1;
+    this.apply();
+  }
+  togglePlay() { if (this.playing) this.stop(); else this.play(); }
+
+  // ---------------------------------------------------------------- frame edits
+  addFrame() {
+    const e = this.e; const fr = this.frames(); const cur = this.current(fr);
+    if (cur >= 0) { const f = fr[cur]; e.active = e.layers.indexOf(f.clips.length ? f.clips[f.clips.length - 1] : f.base); }
+    const l = e.addLayer();
+    if (!l) { this.host.layerLimit(); return; }
+    l.name = 'Frame ' + (this.frames().findIndex((f) => f.base === l) + 1);
+    this.lastFrame = l.uid; this.apply();
+  }
+  duplicateFrame() {
+    const e = this.e; const fr = this.frames(); const cur = this.current(fr); if (cur < 0) return;
+    e.active = e.layers.indexOf(fr[cur].base);
+    const hold = this.hold(fr[cur].base);
+    const l = e.duplicateLayer();
+    if (!l) { this.host.layerLimit(); return; }
+    if (hold) this.st.holds[l.uid] = hold;
+    this.lastFrame = l.uid; this.apply(); this.host.changed();
+  }
+  deleteFrame() {
+    const e = this.e; const fr = this.frames(); const cur = this.current(fr); if (cur < 0) return;
+    if (e.layers.length <= 1) { this.host.toast('The last frame cannot be deleted'); return; }
+    e.active = e.layers.indexOf(fr[cur].base);
+    e.deleteLayer();
+    const after = this.frames(); if (after.length) this.goto(Math.min(cur, after.length - 1));
+  }
+  moveFrame(d: -1 | 1) {
+    const e = this.e; const fr = this.frames(); const cur = this.current(fr); const to = cur + d;
+    if (cur < 0 || to < 0 || to >= fr.length) return;
+    // swap whole units (frame + its clipping layers): the upper unit's layers move down to the lower unit's base
+    const a = fr[cur], b = fr[to];
+    const [lower, upper] = d > 0 ? [a, b] : [b, a];
+    const target = e.layers.indexOf(lower.base);
+    e.history.beginGroup();
+    [upper.base, ...upper.clips].forEach((l, k) => e.moveLayer(e.layers.indexOf(l), target + k));
+    e.history.endGroup('Move frame');
+    e.active = e.layers.indexOf(a.base);
+    this.apply();
+  }
+  setHold(l: Layer, n: number) { n = Math.max(0, Math.min(120, Math.round(n))); if (n) this.st.holds[l.uid] = n; else delete this.st.holds[l.uid]; this.apply(); this.host.changed(); }
+  setRole(l: Layer, r: 'bg' | 'fg' | null) { if (r) this.st.roles[l.uid] = r; else delete this.st.roles[l.uid]; this.apply(); this.host.changed(); }
+  togglePin(l: Layer) { const i = this.st.pins.indexOf(l.uid); if (i >= 0) this.st.pins.splice(i, 1); else this.st.pins.push(l.uid); this.apply(); this.host.changed(); }
+  set<K extends keyof AnimState>(k: K, v: AnimState[K]) { this.st[k] = v; if (this.playing && k === 'fps') { this.stop(); this.play(); } this.apply(); this.host.changed(); }
+
+  // ---------------------------------------------------------------- timeline UI
+  private mount() {
+    if (this.bar) return;
+    this.bar = h('div', { id: 'timeline' });
+    document.body.append(this.bar);
+    document.body.classList.add('anim-on');
+    this.renderBar();
+  }
+  private unmount() { this.closePop(); this.bar?.remove(); this.bar = null; document.body.classList.remove('anim-on'); }
+  closePop() { this.pop?.remove(); this.pop = null; }
+
+  private barKey = '';
+  renderBar() {
+    const bar = this.bar; if (!bar) return;
+    const fr = this.frames(), cur = this.current(fr);
+    const key = JSON.stringify([fr.map((f) => [f.base.uid, this.hold(f.base), this.st.pins.includes(f.base.uid)]), cur, this.playing, this.st.fps, this.st.mode, this.e.w, this.e.h]);
+    if (key === this.barKey) { this.updateThumbs(); return; }
+    this.barKey = key;
+    bar.innerHTML = '';
+    const total = this.ticks(fr).length;
+    const ctl = h('div', { class: 'tl-ctl' },
+      h('button', { class: 'ib', title: this.playing ? 'Pause' : 'Play', 'aria-label': this.playing ? 'Pause' : 'Play', onClick: () => this.togglePlay() }, icon(this.playing ? 'M8 5v14M16 5v14' : 'M7 4.5v15l12.5-7.5z')),
+      h('button', { class: 'ib', title: 'Animation settings', 'aria-label': 'Animation settings', onClick: () => this.openSettings() }, icon('M4 7h10M18 7h2M4 17h4M12 17h8M16 4v6M10 14v6')),
+    );
+    const strip = h('div', { class: 'tl-strip' });
+    const tw = 64, th = Math.max(28, Math.min(64, Math.round((tw * this.e.h) / this.e.w)));
+    fr.forEach((f, i) => {
+      const t = this.thumbFor(f.base, tw, th);
+      const hold = this.hold(f.base);
+      const cell = h('div', { class: 'tl-cell' + (i === cur ? ' on' : '') + (this.st.pins.includes(f.base.uid) ? ' pinned' : ''), 'data-i': String(i) },
+        t, h('span', { class: 'tl-num' }, String(i + 1)));
+      cell.onclick = () => { if (this.playing) this.stop(); if (i === cur) this.openFrameOptions(cell, f); else this.goto(i); };
+      const grp = h('div', { class: 'tl-unit' }, cell);
+      if (hold) grp.append(h('div', { class: 'tl-hold', style: `width:${Math.min(240, hold * 12)}px`, title: `Held for ${hold + 1} frames` }, h('span', {}, '+' + hold)));
+      // drag the grip sideways to change the hold (12 px per frame)
+      const grip = h('div', { class: 'tl-grip', title: 'Drag to hold this frame longer' });
+      grip.onpointerdown = (ev) => {
+        ev.stopPropagation(); grip.setPointerCapture(ev.pointerId);
+        const x0 = ev.clientX, h0 = hold;
+        grip.onpointermove = (m) => { const n = Math.max(0, h0 + Math.round((m.clientX - x0) / 12)); if (n !== this.hold(f.base)) { this.st.holds[f.base.uid] = n; if (!n) delete this.st.holds[f.base.uid]; const hd = grp.querySelector('.tl-hold') as HTMLElement | null; if (hd) { hd.style.width = Math.min(240, n * 12) + 'px'; hd.firstElementChild!.textContent = '+' + n; } } };
+        grip.onpointerup = () => { grip.onpointermove = null; this.barKey = ''; this.apply(); this.host.changed(); };
+      };
+      grp.append(grip);
+      strip.append(grp);
+    });
+    strip.append(h('button', { class: 'tl-add', title: 'New frame', 'aria-label': 'New frame', onClick: () => this.addFrame() }, '+'));
+    const info = h('div', { class: 'tl-info muted' }, `${cur + 1}/${fr.length}`, h('br'), `${this.st.fps} fps · ${(total / this.st.fps).toFixed(1)} s`);
+    bar.append(ctl, strip, info);
+    const on = strip.querySelector('.tl-cell.on') as HTMLElement | null;
+    if (on) requestAnimationFrame(() => on.scrollIntoView({ inline: 'nearest', block: 'nearest' }));
+    this.updateThumbs();
+  }
+  private highlight(i: number) {
+    if (!this.bar) return;
+    this.bar.querySelectorAll('.tl-cell').forEach((c) => c.classList.toggle('play', (c as HTMLElement).dataset.i === String(i)));
+  }
+  private thumbFor(l: Layer, w: number, hh: number) {
+    let t = this.thumbs.get(l.uid);
+    if (!t || t.c.width !== w || t.c.height !== hh) { t = { v: -1, c: h('canvas', { width: w, height: hh, class: 'tl-thumb' }) as HTMLCanvasElement }; this.thumbs.set(l.uid, t); }
+    return t.c;
+  }
+  private thumbTimer = 0;
+  updateThumbs() {
+    clearTimeout(this.thumbTimer);
+    this.thumbTimer = window.setTimeout(() => {
+      if (this.e.stroking) { this.updateThumbs(); return; }
+      for (const f of this.frames()) { const t = this.thumbs.get(f.base.uid); if (t && t.v !== f.base.version) { this.e.thumbnail(f.base, t.c); t.v = f.base.version; } }
+    }, 120);
+  }
+
+  private popAt(anchor: HTMLElement | null, cls: string) {
+    this.closePop();
+    const p = h('div', { class: 'anim-pop ' + cls });
+    document.body.append(p);
+    if (anchor) { const r = anchor.getBoundingClientRect(); p.style.left = Math.max(8, Math.min(innerWidth - 330, r.left + r.width / 2 - 160)) + 'px'; }
+    const close = (ev: PointerEvent) => { if (!p.contains(ev.target as Node) && !(anchor && anchor.contains(ev.target as Node))) { this.closePop(); document.removeEventListener('pointerdown', close, true); } };
+    setTimeout(() => document.addEventListener('pointerdown', close, true));
+    this.pop = p;
+    return p;
+  }
+
+  openFrameOptions(anchor: HTMLElement, f: Frame) {
+    const p = this.popAt(anchor, 'fopts');
+    const draw = () => {
+      p.innerHTML = '';
+      const hold = this.hold(f.base), fr = this.frames(), i = fr.indexOf(fr.find((x) => x.base === f.base)!);
+      const btn = (label: string, fn: () => void, dis = false) => h('button', { class: 'chip', disabled: dis, onClick: () => { fn(); draw(); } }, label);
+      p.append(
+        h('div', { class: 'pop-head' }, h('b', {}, 'Frame ' + (i + 1)), f.base.name !== 'Frame ' + (i + 1) ? h('span', { class: 'muted' }, f.base.name) : ''),
+        h('div', { class: 'fo-row' }, h('span', {}, 'Hold'), h('button', { class: 'ib small', onClick: () => { this.setHold(f.base, hold - 1); draw(); } }, '−'),
+          h('b', { class: 'fo-val' }, `${hold + 1} frame${hold ? 's' : ''}`), h('button', { class: 'ib small', onClick: () => { this.setHold(f.base, hold + 1); draw(); } }, '+'),
+          h('span', { class: 'muted' }, `${((hold + 1) / this.st.fps).toFixed(2)} s`)),
+        h('div', { class: 'chips' },
+          btn('Duplicate', () => { this.duplicateFrame(); this.closePop(); }),
+          btn('Insert blank', () => { this.addFrame(); this.closePop(); }),
+          btn('◀ Move', () => this.moveFrame(-1), i <= 0), btn('Move ▶', () => this.moveFrame(1), i >= fr.length - 1),
+          btn(this.st.pins.includes(f.base.uid) ? 'Unpin from light table' : 'Pin to light table', () => this.togglePin(f.base)),
+          h('button', { class: 'chip danger-text', disabled: this.e.layers.length <= 1, onClick: () => { this.deleteFrame(); this.closePop(); } }, 'Delete')),
+        h('div', { class: 'fo-row' }, h('span', { class: 'muted' }, 'Show on every frame'),
+          btn('Under', () => { this.setRole(f.base, 'bg'); this.closePop(); }), btn('Over', () => { this.setRole(f.base, 'fg'); this.closePop(); })),
+      );
+      const roles = this.e.layers.filter((l) => this.st.roles[l.uid]);
+      if (roles.length) p.append(h('div', { class: 'fo-row' }, h('span', { class: 'muted' }, 'On every frame:'), ...roles.map((l) => h('button', { class: 'chip on', title: 'Make it a frame again', onClick: () => { this.setRole(l, null); draw(); } }, `${l.name} (${this.st.roles[l.uid] === 'bg' ? 'under' : 'over'}) ×`))));
+    };
+    draw();
+  }
+
+  openSettings() {
+    const p = this.popAt(null, 'asettings');
+    const draw = () => {
+      p.innerHTML = '';
+      const s = this.st;
+      const seg = <T extends string>(opts: [T, string][], cur: T, fn: (v: T) => void) => h('div', { class: 'chips' }, ...opts.map(([v, l]) => h('button', { class: 'chip' + (v === cur ? ' on' : ''), onClick: () => { fn(v); draw(); } }, l)));
+      const range = (label: string, min: number, max: number, step: number, v: number, fmt: (v: number) => string, fn: (v: number) => void) => {
+        const out = h('b', { class: 'fo-val' }, fmt(v));
+        const r = h('input', { type: 'range', min: String(min), max: String(max), step: String(step), value: String(v) }) as HTMLInputElement;
+        r.oninput = () => { out.textContent = fmt(+r.value); fn(+r.value); };
+        return h('label', { class: 'srow' }, h('span', {}, label), r, out);
+      };
+      p.append(
+        h('div', { class: 'pop-head' }, h('b', {}, 'Animation'), h('button', { class: 'btn ghost small', onClick: () => { this.toggle(false); this.closePop(); } }, 'Turn off')),
+        h('h4', {}, 'Playback'),
+        seg<PlayMode>([['loop', 'Loop'], ['pingpong', 'Ping-pong'], ['oneshot', 'One shot']], s.mode, (v) => this.set('mode', v)),
+        range('Frames per second', 1, 60, 1, s.fps, (v) => v + ' fps', (v) => this.set('fps', v)),
+        h('div', { class: 'chips' }, ...[6, 8, 12, 15, 24, 30].map((f) => h('button', { class: 'chip' + (s.fps === f ? ' on' : ''), onClick: () => { this.set('fps', f); draw(); } }, String(f)))),
+        h('h4', {}, 'Onion skin'),
+        range('Frames before', 0, 12, 1, s.onionBefore, (v) => String(v), (v) => this.set('onionBefore', v)),
+        range('Frames after', 0, 12, 1, s.onionAfter, (v) => String(v), (v) => this.set('onionAfter', v)),
+        range('Opacity', 0, 100, 1, Math.round(s.onionOpacity * 100), (v) => v + '%', (v) => this.set('onionOpacity', v / 100)),
+        seg<AnimState['tint']>([['redgreen', 'Red / green'], ['blueorange', 'Blue / orange'], ['off', 'True colour']], s.tint, (v) => this.set('tint', v)),
+        h('div', { class: 'chips' }, h('button', { class: 'chip' + (s.blendPrimary ? ' on' : ''), onClick: () => { this.set('blendPrimary', !s.blendPrimary); draw(); } }, 'Blend current frame')),
+        h('h4', {}, 'Light table'),
+        range('Pinned frames', 5, 80, 1, Math.round(s.lightOpacity * 100), (v) => v + '%', (v) => this.set('lightOpacity', v / 100)),
+        h('p', { class: 'muted' }, s.pins.length ? `${s.pins.length} pinned — tap a frame twice → Unpin.` : 'Pin key poses (tap a frame twice → Pin) to keep them visible while you draw in-betweens anywhere in the timeline.'),
+        h('h4', {}, 'Export'),
+        h('div', { class: 'chips' }, h('button', { class: 'btn small', onClick: () => { this.closePop(); this.host.openExport(); } }, 'Export animation…')),
+      );
+    };
+    draw();
+  }
+}
+
+function icon(d: string) {
+  const t = document.createElement('template');
+  t.innerHTML = `<svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="${d}"/></svg>`;
+  return t.content.firstChild as SVGElement;
+}
