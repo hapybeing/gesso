@@ -23,7 +23,7 @@ Known debt: full-canvas textures rather than tiles.
 - [x] Shape snapping (hold at stroke end: line, arc, polyline, ellipse/circle, rectangle/square, polygon; rubber-band, finger = perfect, edit handles, Freehand revert)
 - [ ] Selection: freehand, rectangle, ellipse, magic wand; mask-aware painting; invert/feather/clear
 - [ ] Transform: free, uniform, distort, warp-lite; bilinear/bicubic; flip/rotate 90
-- [ ] Symmetry: vertical, horizontal, quadrant, radial (n), rotational toggle
+- [x] Symmetry: vertical, horizontal, quadrant, radial (2–32, mirror or rotational), assisted drawing toggle, draggable/rotatable guide, saved per artwork
 - [ ] Timelapse: record strokes/ops, replay, export WebM/MP4 via MediaRecorder/WebCodecs
 - [ ] Review R2
 

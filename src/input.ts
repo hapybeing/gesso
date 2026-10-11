@@ -171,7 +171,7 @@ export class Input {
       const t = this.touches.get(e.pointerId); if (t) { t.x = l.x; t.y = l.y; }
       return;
     }
-    if (e.pointerType === 'touch') {
+    if (e.pointerType === 'touch' && e.pointerId !== this.drawId) {
       const t = this.touches.get(e.pointerId);
       if (!t) return;
       t.x = l.x; t.y = l.y;

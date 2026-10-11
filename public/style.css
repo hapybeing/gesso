@@ -187,3 +187,13 @@ input[type=checkbox]{width:22px;height:22px;accent-color:var(--accent)}
   display:flex;align-items:center;gap:10px;background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:6px 6px 6px 18px;font-weight:600;box-shadow:0 8px 30px rgba(0,0,0,.4);max-width:94vw}
 #qsbar.show{opacity:1;transform:translate(-50%,0);pointer-events:auto}
 #qsbar .btn{min-height:40px}
+
+/* symmetry bar */
+#symbar{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:11;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:8px 14px;
+  max-width:min(1240px,98vw);background:var(--panel);border:1px solid var(--line);border-radius:22px;padding:6px 10px;box-shadow:0 8px 30px rgba(0,0,0,.4);animation:pop .14s ease-out}
+.symn{display:flex;align-items:center;gap:6px}
+.symn b{min-width:28px;text-align:center;font-variant-numeric:tabular-nums;font-size:17px}
+.symn .ib{font-size:22px;background:rgba(255,255,255,.06)}
+#symbar .chips{flex-wrap:nowrap;gap:4px}
+#symbar .chip{padding:8px 11px}
+@media (max-width:900px){#symbar .chips{flex-wrap:wrap}}

@@ -8,6 +8,7 @@ import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
 import { readGesso, writeGesso, encodePNG, unpremultiply } from './gessofile';
 import { ShapeTool } from './shapetool';
+import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
 import type { Shape } from './quickshape';
 import { dabsAlong } from './stroke';
 import type { Dab } from './engine';
@@ -55,6 +56,7 @@ const ICON = {
   fill: '<path d="M5 12l7-7 7 7-7 7z"/><path d="M19.5 15.5s1.5 2 1.5 3a1.5 1.5 0 01-3 0c0-1 1.5-3 1.5-3z"/>',
   clear: '<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 8l8 8M16 8l-8 8"/>',
   gallery: '<rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/>',
+  symmetry: '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 6.5C5.5 7.5 4 10 4 12.5S6 18 9 17.5z"/><path d="M15 6.5c3.5 1 5 3.5 5 6s-2 5.5-5 5z"/>',
   sliders: '<path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/>',
 };
 
@@ -112,7 +114,9 @@ class App {
   ovDirty = true;
   shapes: ShapeTool;
   /** an on-canvas handle grabbed by the current pointer */
-  capture: { kind: 'shape'; i: number } | null = null;
+  capture: { kind: 'shape'; i: number } | { kind: 'symC' | 'symR' } | null = null;
+  sym: Symmetry = defaultSymmetry(1, 1);
+  symBar: HTMLElement | null = null;
   strokeBrush: Brush | null = null;
 
   constructor() {
@@ -153,6 +157,7 @@ class App {
     this.engine.onLayersChanged = () => { if (this.popKind === 'layers') this.renderLayers(); this.scheduleThumbs(); };
     this.autosave = new Autosave(this.engine);
     this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
+    this.autosave.extra = () => this.docExtra();
     this.engine.history.onChange = () => { this.updateUndoButtons(); this.autosave.touch(); };
     window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); this.installEvt = e; });
     this.keys();
@@ -195,8 +200,12 @@ class App {
   }
 
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return {}; }
-  applyDocExtra(_x: Record<string, unknown>) { /* set by features */ }
+  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym } }; }
+  applyDocExtra(x: Record<string, unknown>) {
+    const s = x.symmetry as Partial<Symmetry> | undefined;
+    this.sym = { ...defaultSymmetry(this.engine.w, this.engine.h), ...(s || {}) };
+    this.updateSymButton(); if (this.symBar) this.renderSymBar(); this.ovDirty = true;
+  }
 
   showGallery() {
     this.settle();
@@ -319,6 +328,12 @@ class App {
   settle() { this.shapes.commit(); }
 
   captureAt(sx: number, sy: number) {
+    if (this.symBar && this.sym.mode !== 'off') {
+      const hd = guideHandles(this.sym, this.engine);
+      const c = this.engine.docToScreen(hd.c.x, hd.c.y), r = this.engine.docToScreen(hd.r.x, hd.r.y);
+      if (Math.hypot(sx - c.x, sy - c.y) < 30) { this.capture = { kind: 'symC' }; return true; }
+      if (Math.hypot(sx - r.x, sy - r.y) < 30) { this.capture = { kind: 'symR' }; return true; }
+    }
     const i = this.shapes.handleAt(sx, sy);
     if (i >= 0) { this.capture = { kind: 'shape', i }; return true; }
     return false;
@@ -328,6 +343,7 @@ class App {
   strokeStart(s: Sample, _type: string, eraserEnd = false) {
     this.closePop();
     if (this.capture?.kind === 'shape') { this.shapes.beginDrag(this.capture.i); return true; }
+    if (this.capture) return true; // guide handle drag
     this.settle();
     const layer = this.engine.activeLayer;
     if (!layer) return false;
@@ -347,6 +363,12 @@ class App {
   }
   strokeMove(samples: Sample[]) {
     const last = samples[samples.length - 1];
+    if (this.capture?.kind === 'symC') { this.sym.cx = Math.max(0, Math.min(this.engine.w, last.x)); this.sym.cy = Math.max(0, Math.min(this.engine.h, last.y)); this.symChanged(); return; }
+    if (this.capture?.kind === 'symR') {
+      let a = Math.atan2(last.y - this.sym.cy, last.x - this.sym.cx) - (this.sym.mode === 'vertical' ? Math.PI / 2 : 0);
+      const st = Math.PI / 12, sa = Math.round(a / st) * st; if (Math.abs(sa - a) < 0.05) a = sa; // detents every 15°
+      this.sym.angle = a; this.symChanged(); return;
+    }
     if (this.shapes.dragging) { this.shapes.dragTo(last); return; }
     if (this.shapes.phase === 'hold') { this.shapes.holdMove(last); return; }
     if (!this.builder) return;
@@ -356,7 +378,7 @@ class App {
     if (this.strokeTool !== 'smudge' && this.state.settings.snapShapes) { const sp = this.engine.docToScreen(last.x, last.y); this.shapes.pen(sp.x, sp.y); }
   }
   strokeEnd() {
-    if (this.capture) { this.capture = null; this.shapes.endDrag(); return; }
+    if (this.capture) { const k = this.capture.kind; this.capture = null; if (k === 'shape') this.shapes.endDrag(); return; }
     if (this.shapes.phase === 'hold') { this.shapes.holdEnd(); this.builder = null; return; }
     this.shapes.strokeEnded();
     if (!this.builder) return;
@@ -368,8 +390,42 @@ class App {
     this.pushRecent();
   }
 
-  /** symmetry hook: identity until a guide is active */
-  expand(dabs: Dab[]): Dab[] { return dabs; }
+  /** replicate dabs through the symmetry guide (not for smudge: its pickup is order-dependent) */
+  expand(dabs: Dab[]): Dab[] {
+    if (this.sym.mode === 'off' || !this.sym.assist || this.strokeTool === 'smudge') return dabs;
+    return expandDabs(dabs, this.sym);
+  }
+
+  symChanged() { this.ovDirty = true; this.autosave.touch(); this.updateSymButton(); if (this.symBar) this.renderSymBar(); }
+  updateSymButton() { $('#bSym')?.classList.toggle('on', this.sym.mode !== 'off'); }
+  toggleSymBar() {
+    this.settle(); this.closePop();
+    if (this.symBar) { this.symBar.remove(); this.symBar = null; this.ovDirty = true; return; }
+    this.symBar = h('div', { id: 'symbar' });
+    document.body.append(this.symBar);
+    if (this.sym.mode === 'off') { this.sym.mode = 'vertical'; this.symChanged(); }
+    this.renderSymBar();
+    this.ovDirty = true;
+  }
+  renderSymBar() {
+    const bar = this.symBar!; const sy = this.sym;
+    bar.innerHTML = '';
+    const modes: [SymMode, string][] = [['off', 'Off'], ['vertical', 'Vertical'], ['horizontal', 'Horizontal'], ['quadrant', 'Quadrant'], ['radial', 'Radial']];
+    const chip = (label: string, on: boolean, fn: () => void) => h('button', { class: 'chip' + (on ? ' on' : ''), onClick: fn }, label);
+    bar.append(h('div', { class: 'chips' }, ...modes.map(([m, l]) => chip(l, sy.mode === m, () => { sy.mode = m; this.symChanged(); }))));
+    if (sy.mode === 'radial') {
+      bar.append(h('div', { class: 'symn' },
+        h('button', { class: 'ib small', 'aria-label': 'Fewer segments', onClick: () => { sy.n = Math.max(2, sy.n - 1); this.symChanged(); } }, '−'),
+        h('b', {}, String(sy.n)),
+        h('button', { class: 'ib small', 'aria-label': 'More segments', onClick: () => { sy.n = Math.min(32, sy.n + 1); this.symChanged(); } }, '+'),
+        chip('Mirror', sy.mirror, () => { sy.mirror = !sy.mirror; this.symChanged(); })));
+    }
+    bar.append(h('div', { class: 'chips' },
+      chip('Assisted drawing', sy.assist, () => { sy.assist = !sy.assist; this.symChanged(); }),
+      chip('Show guide', sy.show, () => { sy.show = !sy.show; this.symChanged(); }),
+      chip('Centre', false, () => { sy.cx = this.engine.w / 2; sy.cy = this.engine.h / 2; sy.angle = 0; this.symChanged(); }),
+      h('button', { class: 'btn small', onClick: () => this.toggleSymBar() }, 'Done')));
+  }
 
   shapeDabs(sh: Shape): Dab[] {
     const b = this.strokeBrush || this.brushFor(this.tool);
@@ -387,6 +443,7 @@ class App {
     g.setTransform(1, 0, 0, 1, 0, 0);
     g.clearRect(0, 0, c.width, c.height);
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    drawGuide(g, this.engine, this.sym, !!this.symBar);
     this.shapes.drawOverlay(g);
   }
 
@@ -422,6 +479,7 @@ class App {
     this.engine.newDocument(w, h, [1, 1, 1]);
     const now = Date.now();
     const meta: DocMeta = { id: newDocId(), name: name || 'Untitled ' + new Date(now).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }), w, h, bg: [1, 1, 1], bgVisible: true, layers: [], active: 0, created: now, modified: now };
+    this.applyDocExtra({});
     this.autosave.attach(meta, false);
     try { localStorage.setItem('gesso.last', meta.id); } catch { /* private mode */ }
     void this.autosave.flush();
@@ -464,6 +522,7 @@ class App {
       tb('tBrush', ICON.brush, 'Paint', () => this.pickTool('brush')),
       tb('tSmudge', ICON.smudge, 'Smudge', () => this.pickTool('smudge')),
       tb('tEraser', ICON.eraser, 'Erase', () => this.pickTool('eraser')),
+      tb('bSym', ICON.symmetry, 'Symmetry', () => this.toggleSymBar()),
       tb('bLayers', ICON.layers, 'Layers', () => this.togglePop('layers', this.renderLayers)),
       h('button', { id: 'bColor', class: 'swatch', title: 'Colour', 'aria-label': 'Colour', onClick: () => this.togglePop('color', this.renderColor) }),
     );
