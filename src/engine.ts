@@ -871,31 +871,43 @@ export class Engine {
     this.onLayersChanged();
   }
 
-  /** composite preview scaled to fit maxSide, as a 2D canvas (straight alpha) */
-  compositeThumbnail(maxSide = 320, withBg = this.bgVisible): HTMLCanvasElement {
+  /**
+   * composite preview scaled to fit maxSide, as a 2D canvas (straight alpha). Reuses the live composite
+   * (only dirty regions are recomposited) and reads the small result back asynchronously.
+   */
+  async compositeThumbnail(maxSide = 320, withBg = this.bgVisible): Promise<HTMLCanvasElement> {
     const gl = this.gl;
     const k = Math.min(1, maxSide / Math.max(this.w, this.h));
     const tw = Math.max(1, Math.round(this.w * k)), th = Math.max(1, Math.round(this.h * k));
-    this.composite({ x: 0, y: 0, w: this.w, h: this.h }, withBg);
+    let src = this.comp;
+    if (withBg === this.bgVisible) { if (this.dirty) { this.composite(this.dirty); this.dirty = null; this.needsPresent = true; } }
+    else { this.composite({ x: 0, y: 0, w: this.w, h: this.h }, withBg); this.markDirty(); src = this.comp; }
     const t = makeTarget(gl, tw, th);
     bindTarget(gl, t);
     gl.disable(gl.BLEND);
-    // generate mips on the composite for a clean minified sample, then 4x4 supersample on top
-    gl.bindTexture(gl.TEXTURE_2D, this.comp.tex); gl.generateMipmap(gl.TEXTURE_2D);
+    gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.generateMipmap(gl.TEXTURE_2D); this.mipStale = false;
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
-    this.pDown.use().tex('uSrc', 0, this.comp.tex).f('uStep', 1 / tw, 1 / th);
+    this.pDown.use().tex('uSrc', 0, src.tex).f('uStep', 1 / tw, 1 / th);
     this.drawQuad();
-    const px = this.readRect(t, { x: 0, y: 0, w: tw, h: th });
+    const px = await new Readback(gl, t.fb, 0, 0, tw, th).wait();
     freeTarget(gl, t);
-    this.markDirty();
     const out = document.createElement('canvas'); out.width = tw; out.height = th;
     const img = new ImageData(tw, th);
-    for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) {
-      const i = (y * tw + x) * 4, o = i, a = px[i + 3], f = a ? 255 / a : 0;
-      img.data[o] = px[i] * f; img.data[o + 1] = px[i + 1] * f; img.data[o + 2] = px[i + 2] * f; img.data[o + 3] = a;
+    for (let i = 0; i < px.length; i += 4) {
+      const a = px[i + 3], f = a ? 255 / a : 0;
+      img.data[i] = px[i] * f; img.data[i + 1] = px[i + 1] * f; img.data[i + 2] = px[i + 2] * f; img.data[i + 3] = a;
     }
     out.getContext('2d')!.putImageData(img, 0, 0);
     return out;
+  }
+
+  /** full composite, premultiplied RGBA (top row first), read back asynchronously */
+  async compositePixelsAsync(withBg = this.bgVisible): Promise<Uint8Array> {
+    if (withBg === this.bgVisible) { if (this.dirty) { this.composite(this.dirty); this.dirty = null; this.needsPresent = true; } }
+    else this.composite({ x: 0, y: 0, w: this.w, h: this.h }, withBg);
+    const p = new Readback(this.gl, this.comp.fb, 0, 0, this.w, this.h).wait();
+    if (withBg !== this.bgVisible) this.markDirty(); // restore the display composite on the next frame
+    return p;
   }
 
   // ---------------------------------------------------------------- transform support

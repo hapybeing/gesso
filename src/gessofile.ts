@@ -167,7 +167,7 @@ const ORA_OPS = ['svg:src-over', 'svg:multiply', 'svg:screen', 'svg:overlay', 's
   'svg:hard-light', 'svg:soft-light', 'svg:difference', 'svg:exclusion', 'svg:plus', 'krita:linear_burn', 'svg:hue', 'svg:saturation', 'svg:color', 'svg:luminosity'];
 const xmlEsc = (s: string) => s.replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&apos;' }[c]!));
 
-export async function writeGesso(doc: GessoDoc): Promise<Blob> {
+export async function writeGesso(doc: GessoDoc, encodeImg: (px: Uint8Array, w: number, h: number) => Promise<Uint8Array> = encodePNG): Promise<Blob> {
   const manifest = {
     format: 'gesso', version: 1, app: 'Gesso',
     name: doc.name, width: doc.w, height: doc.h, background: doc.bg, backgroundVisible: doc.bgVisible, active: doc.active,
@@ -189,7 +189,7 @@ export async function writeGesso(doc: GessoDoc): Promise<Blob> {
     const px = new Uint8Array(doc.w * doc.h * 4);
     const [r, g, b] = doc.bg.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255));
     for (let i = 0; i < px.length; i += 4) { px[i] = r; px[i + 1] = g; px[i + 2] = b; px[i + 3] = 255; }
-    entries.push({ name: 'data/background.png', data: await encodePNG(px, doc.w, doc.h) });
+    entries.push({ name: 'data/background.png', data: await encodeImg(px, doc.w, doc.h) });
   }
   if (doc.merged) entries.push({ name: 'mergedimage.png', data: doc.merged });
   if (doc.thumb) entries.push({ name: 'Thumbnails/thumbnail.png', data: doc.thumb });

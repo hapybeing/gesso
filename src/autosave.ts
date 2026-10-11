@@ -68,7 +68,7 @@ export class Autosave {
       // capture synchronously: layer list, versions, props, and issue all readbacks in GL order
       const layers = [...e.layers];
       const jobs = layers.filter((l) => this.saved.get(l.uid) !== l.version).map((l) => ({ l, v: l.version, p: e.readLayerAsync(l) }));
-      const thumb = e.compositeThumbnail(360);
+      const thumbP = e.compositeThumbnail(360);
       const m: DocMeta = { ...meta, w: e.w, h: e.h, bg: [...e.bg] as [number, number, number], bgVisible: e.bgVisible, layers: layers.map((l) => l.props()), active: e.active, modified: Date.now(), extra: this.extra() };
       for (const j of jobs) {
         const data = await j.p;
@@ -77,6 +77,7 @@ export class Autosave {
         await store.putLayer(id, j.l.uid, blob);
         this.saved.set(j.l.uid, j.v);
       }
+      const thumb = await thumbP;
       const tb = await new Promise<Blob | null>((res) => thumb.toBlob(res, 'image/webp', 0.86));
       if (tb) await store.putThumb(id, tb);
       await store.putMeta(m);

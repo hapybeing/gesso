@@ -6,7 +6,8 @@ import { pressureSection } from './pressureui';
 import { store, newDocId, DocMeta } from './store';
 import { Autosave, loadDocPixels } from './autosave';
 import { Gallery, ask } from './gallery';
-import { readGesso, writeGesso, encodePNG, unpremultiply } from './gessofile';
+import { readGesso, writeGesso } from './gessofile';
+import { pngEncode } from './workerclient';
 import { ShapeTool } from './shapetool';
 import { TransformTool } from './transformtool';
 import type { Target } from './gl';
@@ -282,16 +283,17 @@ class App {
   /** build the .gesso file for the open artwork */
   async buildGesso(): Promise<Blob> {
     const e = this.engine;
-    const layers = [];
-    for (const l of [...e.layers]) {
-      const px = unpremultiply(await e.readLayerAsync(l));
-      layers.push({ props: l.props(), png: await encodePNG(px, e.w, e.h) });
-    }
-    const merged = await encodePNG(new Uint8Array(e.compositePixels(e.bgVisible).buffer), e.w, e.h);
-    const tc = e.compositeThumbnail(256);
+    // issue every GPU readback first (in GL order), then encode them in the worker as they arrive
+    const ls = [...e.layers];
+    const reads = ls.map((l) => e.readLayerAsync(l));
+    const mergedP = e.compositePixelsAsync(e.bgVisible);
+    const thumbP = e.compositeThumbnail(256);
+    const layers = await Promise.all(ls.map(async (l, i) => ({ props: l.props(), png: await pngEncode(await reads[i], e.w, e.h, true) })));
+    const merged = await pngEncode(await mergedP, e.w, e.h, true);
+    const tc = await thumbP;
     const tpx = tc.getContext('2d')!.getImageData(0, 0, tc.width, tc.height).data;
-    const thumb = await encodePNG(new Uint8Array(tpx.buffer), tc.width, tc.height);
-    return writeGesso({ name: this.autosave.meta?.name || 'Untitled', w: e.w, h: e.h, bg: e.bg, bgVisible: e.bgVisible, active: e.active, layers, merged, thumb, extra: this.docExtra() });
+    const thumb = await pngEncode(new Uint8Array(tpx.buffer), tc.width, tc.height, false);
+    return writeGesso({ name: this.autosave.meta?.name || 'Untitled', w: e.w, h: e.h, bg: e.bg, bgVisible: e.bgVisible, active: e.active, layers, merged, thumb, extra: this.docExtra() }, (px, w, h) => pngEncode(px, w, h, false));
   }
 
   async exportGessoFile(id?: string) {
@@ -986,7 +988,9 @@ class App {
   async exportPNG(withBg?: boolean) {
     this.toast('Exporting…');
     try {
-      const blob = await this.engine.exportPNG(withBg);
+      const e = this.engine;
+      const png = await pngEncode(await e.compositePixelsAsync(withBg ?? e.bgVisible), e.w, e.h, true);
+      const blob = new Blob([png as unknown as BlobPart], { type: 'image/png' });
       const name = `gesso-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`;
       const file = new File([blob], name, { type: 'image/png' });
       const nav = navigator as Navigator & { canShare?: (d: ShareData) => boolean };
