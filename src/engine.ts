@@ -1071,6 +1071,44 @@ export class Engine {
     this.history.push({ label, bytes: Math.max(64, tileBytes(before)), undo: swap, redo: swap, dispose: () => pool.freeTiles(held) });
   }
 
+  private pPaint: Program | null = null;
+  /**
+   * Paint a solid fill, a gradient or a recolour onto the active layer through optional coverage bytes
+   * (row 0 = top, cov.rect in doc px) and the selection; one undo step holding only the painted tiles.
+   */
+  paintLayer(o: { mode: 0 | 1 | 2 | 3; c0: [number, number, number, number]; c1?: [number, number, number, number]; p0?: { x: number; y: number }; p1?: { x: number; y: number };
+    seed?: [number, number, number]; cov?: { data: Uint8Array; rect: Rect }; opacity?: number; label: string }) {
+    const layer = this.activeLayer;
+    if (!layer || layer.group) return false;
+    const gl = this.gl;
+    if (!this.pPaint) this.pPaint = this.program(S.PAINT_FS);
+    let ct: WebGLTexture | null = null;
+    if (o.cov) {
+      ct = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, ct);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8, o.cov.rect.w, o.cov.rect.h, 0, gl.RED, gl.UNSIGNED_BYTE, o.cov.data);
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    }
+    const r = o.cov ? o.cov.rect : { x: 0, y: 0, w: this.w, h: this.h };
+    this.tileEdit(layer, o.label, (src) => {
+      const t = this.newTarget();
+      bindTarget(gl, t); gl.disable(gl.BLEND);
+      const c1 = o.c1 ?? o.c0, p0 = o.p0 ?? { x: 0, y: 0 }, p1 = o.p1 ?? { x: 1, y: 0 }, sd = o.seed ?? [0, 0, 0];
+      this.pPaint!.use().tex('uLayer', 0, src.tex).tex('uSel', 1, this.sel ? this.sel.tex : null).i('uUseSel', this.sel ? 1 : 0)
+        .tex('uCov', 2, ct).i('uUseCov', ct ? 1 : 0).i('uLock', layer.alphaLock ? 1 : 0).i('uMode', o.mode)
+        .f('uRect', r.x, r.y, r.w, r.h).f('uDoc', this.w, this.h).f('uC0', ...o.c0).f('uC1', ...c1).f('uP0', p0.x, p0.y).f('uP1', p1.x, p1.y)
+        .f('uSeed', ...sd).f('uOpacity', o.opacity ?? 1);
+      this.drawQuad();
+      return t;
+    });
+    if (ct) gl.deleteTexture(ct);
+    this.onStrokeCommitted();
+    return true;
+  }
+
   /** clear the layer, or only the selected pixels when there is a selection */
   clearLayer() {
     if (this.activeLayer.group) return;

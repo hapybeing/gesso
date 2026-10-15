@@ -449,3 +449,36 @@ export const WET_OUT_FS = `#version 300 es
 precision highp float; in vec2 vUv; out vec4 o;
 uniform sampler2D uF;
 void main(){ vec4 f = texture(uF, vUv); o = vec4(clamp(f.r + f.b, 0.0, 1.0), 0.0, 0.0, 1.0); }`;
+
+// Fill / gradient / recolour onto a layer (M5). Coverage (optional, R8 over uRect in doc px) × selection × opacity.
+// uMode 0 solid uC0 · 1 linear uP0→uP1 · 2 radial (centre uP0, radius |uP1−uP0|) · 3 recolour: every covered
+// pixel keeps its offset from the seed colour uSeed (shading and anti-aliasing survive), shifted to uC0.
+// Colours are straight RGBA; gradients interpolate premultiplied (no dark fringe toward transparent) and are
+// dithered by ±½ LSB so 8-bit gradients do not band. Alpha lock recolours existing paint only.
+export const PAINT_FS = `#version 300 es
+precision highp float;
+in vec2 vUv; out vec4 o;
+uniform sampler2D uLayer, uSel, uCov; uniform int uUseSel, uUseCov, uLock, uMode;
+uniform vec4 uRect, uC0, uC1; uniform vec2 uDoc, uP0, uP1; uniform vec3 uSeed; uniform float uOpacity;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+void main(){
+  vec4 L = texture(uLayer, vUv);
+  vec2 p = vUv * uDoc;
+  float m = (uUseSel == 1 ? texture(uSel, vUv).r : 1.0) * uOpacity;
+  if (uUseCov == 1) { vec2 q = (p - uRect.xy) / uRect.zw; m *= (q.x < 0.0 || q.y < 0.0 || q.x > 1.0 || q.y > 1.0) ? 0.0 : texture(uCov, q).r; }
+  if (uMode == 3) {
+    vec3 s = L.a > 0.0 ? L.rgb / L.a : vec3(0.0);
+    vec3 n = clamp(s + (uC0.rgb - uSeed), 0.0, 1.0);
+    o = vec4(mix(L.rgb, n * L.a, m), L.a); return;
+  }
+  vec4 c0 = vec4(uC0.rgb * uC0.a, uC0.a), pc = c0;
+  if (uMode > 0) {
+    vec2 d = uP1 - uP0;
+    float t = uMode == 1 ? dot(p - uP0, d) / max(dot(d, d), 1e-6) : length(p - uP0) / max(length(d), 1e-6);
+    pc = mix(c0, vec4(uC1.rgb * uC1.a, uC1.a), clamp(t, 0.0, 1.0));
+    pc = clamp(pc + (hash(p) - 0.5) / 255.0 * vec4(1.0), 0.0, 1.0); pc.rgb = min(pc.rgb, vec3(pc.a));
+  }
+  vec4 src = pc * m;
+  if (uLock == 1) { vec3 sc = src.a > 0.0 ? src.rgb / src.a : vec3(0.0); o = vec4(mix(L.rgb, sc * L.a, src.a), L.a); }
+  else o = src + L * (1.0 - src.a);
+}`;

@@ -23,6 +23,7 @@ import { TransformTool, homography } from './transformtool';
 import { SelectTool, SelKind } from './selecttool';
 import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
+import { FillTool, FillSettings, FillRef, defaultFill } from './filltool';
 import { Guides, GuideKind, GUIDE_LABEL, defaultGuides, GuideAssist, GuideHandle, guideHandleAt, dragGuideHandle, drawGuides, rulerAngle } from './guides';
 import type { Shape } from './quickshape';
 import { dabsAlong } from './stroke';
@@ -137,6 +138,13 @@ class App {
   guides: Guides = defaultGuides(1, 1);
   guideBar: HTMLElement | null = null;
   assist: GuideAssist | null = null;
+  /** fill / gradient / recolour tool (also serves ColorDrop from the colour button) */
+  fill!: FillTool;
+  fillBar: HTMLElement | null = null;
+  fillOn = false;
+  fillSet: FillSettings = { ...defaultFill(), ...(JSON.parse(localStorage.getItem('gesso.fill') || '{}') as Partial<FillSettings>) };
+  /** uid of the layer marked as the fill reference (per artwork) */
+  refUid: string | null = null;
   private assistPending = false;
   xform: TransformTool | null = null;
   selTool: SelectTool | null = null;
@@ -190,6 +198,16 @@ class App {
     this.autosave = new Autosave(this.engine);
     this.autosave.onState = (st) => { $('#bGallery')?.setAttribute('data-save', st); };
     this.autosave.extra = () => this.docExtra();
+    this.fill = new FillTool({
+      engine: this.engine, settings: () => this.fillSet, colour: () => this.state.color, previous: () => this.previousColour(),
+      pixels: (ref: FillRef) => {
+        const e = this.engine, rl = this.refUid ? e.layers.find((l) => l.uid === this.refUid && !l.group) : null;
+        if (ref === 'layer') return e.readLayerAsync(e.activeLayer);
+        if (ref === 'reference' && rl) return e.readLayerAsync(rl);
+        return e.compositePixelsAsync(false);
+      },
+      overlayChanged: () => { this.ovDirty = true; }, toast: (m) => this.toast(m), changed: () => { this.pushRecent(); },
+    });
     this.adj = new AdjustUI({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), overlayChanged: () => { this.ovDirty = true; },
       changed: () => { $('#bAdjust')?.classList.toggle('on', this.adj.active); this.updateUndoButtons(); } });
     this.text = new TextTool({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), color: () => [...this.state.color] as [number, number, number],
@@ -262,13 +280,14 @@ class App {
   }
 
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st } }; }
+  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st } }; }
   applyDocExtra(x: Record<string, unknown>) {
     this.anim.load(x.anim as Partial<AnimState> | undefined);
     $('#bAnim')?.classList.toggle('on', this.anim.on);
     const s = x.symmetry as Partial<Symmetry> | undefined;
     this.sym = { ...defaultSymmetry(this.engine.w, this.engine.h), ...(s || {}) };
     this.updateSymButton(); if (this.symBar) this.renderSymBar(); this.ovDirty = true;
+    this.refUid = typeof x.fillRef === 'string' ? x.fillRef : null;
     const gd = x.guides as Partial<Guides> | undefined;
     this.guides = { ...defaultGuides(this.engine.w, this.engine.h), ...(gd || {}) };
     this.guidesChanged(false);
@@ -630,8 +649,89 @@ class App {
 
   // ---------------------------------------------------------------- selection
   toggleSelectTool() { if (this.selTool) this.exitSelectTool(); else this.enterSelectTool(); }
+  // ---------------------------------------------------------------- fill tool
+  previousColour(): [number, number, number] {
+    const cur = toHex(this.state.color), h = this.state.recent.find((x) => x !== cur);
+    return (h && fromHex(h)) || [1, 1, 1];
+  }
+  saveFill() { localStorage.setItem('gesso.fill', JSON.stringify(this.fillSet)); }
+  toggleFillTool() { if (this.fillOn) this.exitFillTool(); else this.enterFillTool(); }
+  enterFillTool() {
+    this.settle(); this.closePop();
+    if (this.selTool) this.exitSelectTool();
+    if (this.guideBar) this.toggleGuideBar();
+    if (this.symBar) this.toggleSymBar();
+    this.fillOn = true; this.input.grab = this.fill;
+    this.fillBar = h('div', { id: 'fillbar' }); document.body.append(this.fillBar);
+    this.renderFillBar(); $('#bFill')?.classList.add('on');
+  }
+  exitFillTool() {
+    if (!this.fillOn) return;
+    this.fill.cancel(); this.fillOn = false;
+    if (this.input.grab === this.fill) this.input.grab = null;
+    this.fillBar?.remove(); this.fillBar = null; $('#bFill')?.classList.remove('on'); this.ovDirty = true;
+  }
+  renderFillBar() {
+    const bar = this.fillBar; if (!bar) return;
+    const f = this.fillSet, e = this.engine;
+    bar.innerHTML = '';
+    const chip = (label: string, on: boolean, fn: () => void, title?: string) => h('button', { class: 'chip' + (on ? ' on' : ''), title: title || label, onClick: () => { fn(); this.saveFill(); this.renderFillBar(); } }, label);
+    const slider = (label: string, min: number, max: number, step: number, get: () => number, set: (v: number) => void, fmt: (v: number) => string) => {
+      const r = h('input', { type: 'range', min, max, step, value: get(), class: 'edge-range', 'aria-label': label }) as HTMLInputElement;
+      const out = h('b', { class: 'edge-val' }, fmt(get()));
+      r.oninput = () => { set(+r.value); out.textContent = fmt(+r.value); }; r.onchange = () => this.saveFill();
+      return h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, label), r, out);
+    };
+    bar.append(h('div', { class: 'chips' }, chip('Fill', f.mode === 'fill', () => { f.mode = 'fill'; }), chip('Gradient', f.mode === 'gradient', () => { f.mode = 'gradient'; }), chip('Recolour', f.mode === 'recolour', () => { f.mode = 'recolour'; })));
+    const row = h('div', { class: 'chips' });
+    if (f.mode === 'fill') {
+      const rl = this.refUid ? e.layers.find((l) => l.uid === this.refUid) : null;
+      row.append(chip('Canvas', f.ref === 'canvas', () => { f.ref = 'canvas'; }, 'Regions from everything visible'), chip('Layer', f.ref === 'layer', () => { f.ref = 'layer'; }, 'Regions from the active layer'),
+        chip(rl ? 'Ref: ' + rl.name : 'Reference', f.ref === 'reference', () => { f.ref = 'reference'; if (!rl) this.toast('Mark a layer as Reference in the Layers panel'); }, 'Regions from the reference layer (line art), filled on the active layer'));
+      row.append(slider('Threshold', 0, 100, 1, () => Math.round(f.threshold * 100), (v) => { f.threshold = v / 100; }, (v) => v + '%'),
+        slider('Close gaps', 0, 12, 1, () => f.gap, (v) => { f.gap = v; }, (v) => v ? v * 2 + ' px' : 'off'),
+        slider('Expand', 0, 4, 0.5, () => f.expand, (v) => { f.expand = v; }, (v) => v + ' px'));
+    } else if (f.mode === 'gradient') {
+      row.append(chip('Linear', f.grad === 'linear', () => { f.grad = 'linear'; }), chip('Radial', f.grad === 'radial', () => { f.grad = 'radial'; }),
+        chip('→ Transparent', f.gradTo === 'transparent', () => { f.gradTo = 'transparent'; }), chip('→ Previous colour', f.gradTo === 'previous', () => { f.gradTo = 'previous'; }));
+    } else {
+      row.append(chip('Connected', !f.global, () => { f.global = false; }), chip('Everywhere', f.global, () => { f.global = true; }, 'Every similar colour on the layer'),
+        slider('Threshold', 0, 100, 1, () => Math.round(f.threshold * 100), (v) => { f.threshold = v / 100; }, (v) => v + '%'));
+    }
+    bar.append(row);
+    bar.append(h('div', { class: 'chips' }, h('span', { class: 'muted small' }, f.mode === 'gradient' ? 'Drag across the canvas' : 'Touch to fill · slide sideways before lifting to change the threshold'),
+      h('button', { class: 'btn small', onClick: () => this.exitFillTool() }, 'Done')));
+  }
+  /** ColorDrop: drag the colour button onto the canvas to fill there (no tool switch) */
+  private colorDrop(btn: HTMLElement) {
+    btn.addEventListener('pointerdown', (ev) => {
+      const id = ev.pointerId, x0 = ev.clientX, y0 = ev.clientY; let dot: HTMLElement | null = null;
+      const move = (m: PointerEvent) => {
+        if (m.pointerId !== id) return;
+        if (!dot && Math.hypot(m.clientX - x0, m.clientY - y0) > 24) { dot = h('div', { class: 'cdrop', style: `background:${toHex(this.state.color)}` }); document.body.append(dot); }
+        if (dot) { dot.style.left = m.clientX + 'px'; dot.style.top = m.clientY + 'px'; }
+      };
+      const up = (u: PointerEvent) => {
+        if (u.pointerId !== id) return;
+        window.removeEventListener('pointermove', move, true); window.removeEventListener('pointerup', up, true); window.removeEventListener('pointercancel', up, true);
+        if (!dot) return;
+        dot.remove();
+        const eat = (c: Event) => { c.stopPropagation(); c.preventDefault(); };
+        window.addEventListener('click', eat, { capture: true, once: true }); setTimeout(() => window.removeEventListener('click', eat, true), 400);
+        if (u.type !== 'pointerup') return;
+        const cv = $('#view') as HTMLElement, r = cv.getBoundingClientRect();
+        const under = document.elementFromPoint(u.clientX, u.clientY);
+        if (under !== cv && under !== this.ov) return;
+        const keep = this.fillSet.mode; this.fillSet.mode = 'fill';
+        void this.fill.drop(u.clientX - r.left, u.clientY - r.top).finally(() => { this.fillSet.mode = keep; });
+      };
+      window.addEventListener('pointermove', move, true); window.addEventListener('pointerup', up, true); window.addEventListener('pointercancel', up, true);
+    });
+  }
+
   enterSelectTool() {
     this.settle(); this.closePop();
+    this.exitFillTool();
     if (this.symBar) this.toggleSymBar();
     this.selTool = new SelectTool({
       engine: this.engine,
@@ -707,6 +807,7 @@ class App {
   }
   /** lift the selection (or the whole layer) into the transform box */
   async startLayerTransform() {
+    this.exitFillTool();
     this.settle(); this.closePop();
     const e = this.engine, layer = e.activeLayer;
     if (!layer.visible) { this.toast('This layer is hidden'); return; }
@@ -753,6 +854,7 @@ class App {
     this.shapes.drawOverlay(g);
     this.xform?.drawOverlay(g);
     this.selTool?.drawOverlay(g);
+    this.fill?.drawOverlay(g);
     this.adj?.drawOverlay(g);
     this.drawPrediction(g);
     this.text?.drawOverlay(g);
@@ -834,6 +936,7 @@ class App {
       tb('bExport', ICON.share, 'Export PNG', () => this.exportPNG()),
       tb('bSelect', ICON.select, 'Select', () => this.toggleSelectTool()),
       tb('bTransform', ICON.transform, 'Transform', () => void this.startLayerTransform()),
+      tb('bFill', ICON.fill, 'Fill, gradient, recolour', () => this.toggleFillTool()),
       tb('bText', ICON.text, 'Text', () => { this.settle(); this.closePop(); if (this.text.active) this.text.disarm(); else { if (this.selTool) this.exitSelectTool(); this.text.arm(); } }),
       tb('bAdjust', ICON.adjust, 'Adjustments', () => this.togglePop('adjust', (el) => this.adj.renderMenu(el, () => this.closePop()))),
     );
@@ -845,7 +948,7 @@ class App {
       tb('bSym', ICON.symmetry, 'Symmetry', () => this.toggleSymBar()),
       tb('bGuide', ICON.guide, 'Drawing guides', () => this.toggleGuideBar()),
       tb('bLayers', ICON.layers, 'Layers', () => this.togglePop('layers', this.renderLayers)),
-      h('button', { id: 'bColor', class: 'swatch', title: 'Colour', 'aria-label': 'Colour', onClick: () => this.togglePop('color', this.renderColor) }),
+      (() => { const b = h('button', { id: 'bColor', class: 'swatch', title: 'Colour (drag onto the canvas to fill)', 'aria-label': 'Colour', onClick: () => this.togglePop('color', this.renderColor) }); this.colorDrop(b); return b; })(),
     );
     top.append(left, right);
 
@@ -1255,7 +1358,8 @@ class App {
       h('label', { class: 'srow' }, h('span', {}, 'Blend'), blend),
       h('div', { class: 'chips' },
         tog('Alpha lock', ICON.lock, l.alphaLock, () => e.setProp(l, 'alphaLock', !l.alphaLock)),
-        tog('Clipping mask', ICON.clip, l.clip, () => e.setProp(l, 'clip', !l.clip))),
+        tog('Clipping mask', ICON.clip, l.clip, () => e.setProp(l, 'clip', !l.clip)),
+        tog('Reference', ICON.fill, this.refUid === l.uid, () => { this.refUid = this.refUid === l.uid ? null : l.uid; if (this.refUid) { this.fillSet.ref = 'reference'; this.saveFill(); } this.fill.invalidate(); this.autosave.touch(); this.renderLayers(); this.renderFillBar(); })),
       h('div', { class: 'acts' },
         act('Move up', ICON.up, () => e.moveBlock(l, 1), e.active >= e.layers.length - 1),
         act('Move down', ICON.down, () => e.moveBlock(l, -1), e.active <= 0 && !l.parent),
