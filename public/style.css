@@ -322,3 +322,8 @@ body.anim-on #textbar{bottom:calc(122px + env(safe-area-inset-bottom,0px))}
 .ref-x{margin-left:auto;font-size:22px;width:40px;height:40px}
 .ref-cv{flex:1;min-height:0;width:100%;background:repeating-conic-gradient(#2a2826 0 25%,#242220 0 50%) 0 0/16px 16px}
 .ref-grip{position:absolute;right:0;bottom:0;width:28px;height:28px;cursor:nwse-resize;touch-action:none;background:linear-gradient(135deg,transparent 55%,rgba(255,255,255,.35) 56% 62%,transparent 63% 72%,rgba(255,255,255,.35) 73% 79%,transparent 80%)}
+/* long-press reorder (layers, timeline) */
+.drag-ghost{opacity:.92;box-shadow:0 10px 28px rgba(0,0,0,.55);transform:scale(1.03);border-radius:12px;background:var(--panel)}
+.drag-src{opacity:.35}
+.drag-bar{position:fixed;z-index:9998;background:var(--accent);border-radius:2px;pointer-events:none}
+.drag-bar.y{height:4px}.drag-bar.x{width:4px}

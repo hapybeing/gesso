@@ -158,10 +158,12 @@ export class TilePool {
   }
   private restoreState(s: ReturnType<TilePool['saveState']>) {
     const gl = this.gl;
-    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, s.draw); gl.bindFramebuffer(gl.READ_FRAMEBUFFER, s.read);
+    // a binding saved before takeTiles freed that texture must not be restored (deleted object)
+    gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, s.draw && gl.isFramebuffer(s.draw) ? s.draw : null);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, s.read && gl.isFramebuffer(s.read) ? s.read : null);
     gl.viewport(s.vp[0], s.vp[1], s.vp[2], s.vp[3]);
     if (s.sc) gl.enable(gl.SCISSOR_TEST); else gl.disable(gl.SCISSOR_TEST);
-    gl.bindTexture(gl.TEXTURE_2D, s.tex);
+    gl.bindTexture(gl.TEXTURE_2D, s.tex && gl.isTexture(s.tex) ? s.tex : null);
     gl.clearColor(s.cc[0], s.cc[1], s.cc[2], s.cc[3]);
   }
   private copyTilesInto(l: TiledLayer, t: Target) {
@@ -205,16 +207,44 @@ export class TilePool {
     const lru = [...this.resident].filter((x) => x.lastUse < this.frame).sort((a, b) => a.lastUse - b.lastUse);
     for (const x of lru) {
       if (this.resident.size < this.maxResident * 2) break;
-      if (!this.evict(x)) continue;
-      const e = this.pending.get(x);
-      if (!e) continue; // fast path already freed it
-      const gl = this.gl, px = new Uint8Array(e.tx * e.ty * 4);
-      e.rb.dispose(); this.pending.delete(x);
-      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.r2!.fb);
-      gl.readPixels(0, 0, e.tx, e.ty, gl.RGBA, gl.UNSIGNED_BYTE, px);
-      this.finishEvict(e, px);
+      this.evictNow(x);
     }
   }
+
+  /** evict a resident layer right now (synchronous tiny readback when its tiles are stale) */
+  private evictNow(x: TiledLayer) {
+    if (!this.evict(x)) return;
+    const e = this.pending.get(x);
+    if (!e) return; // fast path already freed it
+    const gl = this.gl, px = new Uint8Array(e.tx * e.ty * 4);
+    e.rb.dispose(); this.pending.delete(x);
+    gl.bindFramebuffer(gl.READ_FRAMEBUFFER, this.r2!.fb);
+    gl.readPixels(0, 0, e.tx, e.ty, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.finishEvict(e, px);
+  }
+
+  /**
+   * Take a layer's pixels out as an exact sparse tile map (only tiles holding paint), leaving the layer empty.
+   * Ownership of the tiles passes to the caller (an undo entry): give them back with putTiles or freeTiles.
+   * Costs nothing when the tiles are already in sync; otherwise one reduction pass and a tiles-sized readback.
+   */
+  takeTiles(l: TiledLayer): Map<number, TileRef> {
+    const st = this.saveState();
+    this.cancelEvict(l);
+    if (l.res) this.evictNow(l);
+    if (l.res) { freeTarget(this.gl, l.res); l.res = null; this.resident.delete(l); } // (evict refused: version raced)
+    this.restoreState(st);
+    const m = l.tiles; l.tiles = new Map(); l.tilesVersion = -1;
+    return m;
+  }
+  /** install a tile map as the pixels of a layer emptied by takeTiles; call after bumping layer.version */
+  putTiles(l: TiledLayer, m: Map<number, TileRef>) {
+    this.dropTiles(l);
+    l.tiles = m; l.tilesVersion = l.version;
+  }
+  freeTiles(m: Map<number, TileRef>) { for (const r of m.values()) this.release(r); m.clear(); }
+  /** a readable full-size texture holding a detached tile map (shared scratch, valid until the next call) */
+  readableTiles(m: Map<number, TileRef>): Target { return this.readable({ res: null, tiles: m, tilesVersion: -1, version: 0, lastUse: 0 }); }
 
   /** start evicting a resident layer (async). Returns false when it is not resident. */
   evict(l: TiledLayer): boolean {

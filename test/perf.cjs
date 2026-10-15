@@ -22,7 +22,9 @@ const W = +(process.argv[3] || 2560), H = +(process.argv[4] || 1600), NL = +(pro
     sync(); let so = 0; for (let k = 0; k < 5; k++) { const t = performance.now(); sync(); so += performance.now() - t; } so /= 5;
     e.stats = { dabs: 0, compositePx: 0, presents: 0, presentPx: 0 };
     const orr = e.render.bind(e);
-    e.render = () => { const t = performance.now(); orr(); sync(); if (cur) cur.render += Math.max(0, performance.now() - t - so); };
+    // input-to-ink: dispatch of a pen event → end of the next render that presents it (GL finished)
+    let pendingT = 0; const lat = [];
+    e.render = () => { const t = performance.now(); orr(); sync(); if (cur) cur.render += Math.max(0, performance.now() - t - so); if (pendingT) { lat.push(Math.max(0, performance.now() - pendingT - so)); pendingT = 0; } };
     const oe = e.endStroke.bind(e); let endMs = 0;
     e.endStroke = () => { sync(); const t = performance.now(); oe(); sync(); endMs = Math.max(0, performance.now() - t - so); };
     const oa = e.addDabs.bind(e);
@@ -43,12 +45,20 @@ const W = +(process.argv[3] || 2560), H = +(process.argv[4] || 1600), NL = +(pro
         const list = []; for (let k = 0; k < PER && i <= N; k++, i++) list.push(mk('pointermove', ...pos(i)));
         const ev = list[list.length - 1];
         Object.defineProperty(ev, 'getCoalescedEvents', { value: () => list });
-        sync(); const t = performance.now(); cv.dispatchEvent(ev); sync(); cur.input = Math.max(0, performance.now() - t - so);
+        sync(); const t = performance.now(); cv.dispatchEvent(ev); sync(); cur.input = Math.max(0, performance.now() - t - so); pendingT = t;
         requestAnimationFrame(frame);
       };
       requestAnimationFrame(frame);
     });
     cv.dispatchEvent(mk('pointerup', ...pos(N)));
+    // tile release: switch to another layer; the painted one is evicted to atlas tiles after the idle period
+    const pool = e.pool; const om = pool.maintain.bind(pool); const mt = [];
+    pool.maintain = (k) => { const t = performance.now(); om(k); sync(); mt.push(Math.max(0, performance.now() - t - so)); };
+    const painted = e.activeLayer; e.active = (e.active + 1) % e.layers.length;
+    let rf = 0; const tr0 = performance.now();
+    while (painted.res && rf < 400) { await new Promise((r) => requestAnimationFrame(r)); rf++; }
+    const release = { frames: rf, ms: Math.round(performance.now() - tr0), released: !painted.res, tiles: painted.tiles.size, maintainMaxMs: Math.round(Math.max(0, ...mt)), maintainP50: Math.round([...mt].sort((a, b) => a - b)[mt.length >> 1] || 0) };
+    pool.maintain = om;
     e.render = orr;
     const q = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
     const r = (v) => Math.round(v * 100) / 100;
@@ -56,7 +66,8 @@ const W = +(process.argv[3] || 2560), H = +(process.argv[4] || 1600), NL = +(pro
     return { frames: frames.length, dabsPerFrame: r(frames.reduce((s, x) => s + x.dabs, 0) / frames.length),
       inputP50: r(q(frames.map((x) => x.input), 0.5)), renderP50: r(q(frames.map((x) => x.render), 0.5)),
       syncOverheadMs: r(so), compositeMpxPerFrame: r(e.stats.compositePx / frames.length / 1e6), presentMpxPerFrame: r(e.stats.presentPx / Math.max(1, e.stats.presents) / 1e6),
-      frameP50: r(q(tot, 0.5)), frameP95: r(q(tot, 0.95)), frameMax: r(Math.max(...tot)), endStrokeMs: r(endMs) };
+      frameP50: r(q(tot, 0.5)), frameP95: r(q(tot, 0.95)), frameMax: r(Math.max(...tot)), endStrokeMs: r(endMs),
+      inkLatencyP50: r(q(lat, 0.5)), inkLatencyP95: r(q(lat, 0.95)), release };
   }, [brush, NL]);
   console.log(JSON.stringify({ brush, canvas: `${W}x${H}`, layers: NL, ...res }));
   if (T.errs.length) console.log('errors:', T.errs);

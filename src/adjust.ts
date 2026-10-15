@@ -3,7 +3,7 @@
 // A session keeps the original pixels; every parameter change re-renders filter(original) into the layer, so
 // previews never accumulate error. Apply records one undo step; Cancel restores the original exactly.
 import type { Engine, Layer } from './engine';
-import { Program, Target, makeTarget, freeTarget, bindTarget, makeTexture } from './gl';
+import { Program, Target, makeTarget, freeTarget, bindTarget, makeTexture, Readback } from './gl';
 
 export type AdjKind = 'hsb' | 'balance' | 'curves' | 'blur' | 'sharpen' | 'noise' | 'gradmap' | 'liquify';
 export const ADJ_LABEL: Record<AdjKind, string> = {
@@ -157,6 +157,32 @@ export class AdjustSession {
     this.orig = e.copyOfLayer(this.layer);
     this.params = { ...params };
     if (kind === 'liquify') this.resetLiquify();
+  }
+  /**
+   * Histogram of the original pixels (inside the selection when there is one): 4×256 bins (luma, R, G, B),
+   * straight (un-premultiplied) colour weighted by alpha × selection. Point-sampled down to ≤ 512² on the GPU
+   * so the value distribution is preserved, then read back asynchronously (never stalls the frame).
+   */
+  async histogram(): Promise<Float32Array[]> {
+    const e = this.e, gl = e.gl;
+    const k = Math.max(1, Math.max(e.w, e.h) / 512), w = Math.max(1, Math.round(e.w / k)), h = Math.max(1, Math.round(e.h / k));
+    const small = makeTarget(gl, w, h, { filter: gl.NEAREST }), ms = e.sel ? makeTarget(gl, w, h, { filter: gl.NEAREST }) : null;
+    const blit = (src: Target, dst: Target) => {
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, src.fb); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, dst.fb);
+      gl.disable(gl.SCISSOR_TEST);
+      gl.blitFramebuffer(0, 0, e.w, e.h, 0, 0, w, h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+    };
+    blit(this.orig, small); if (ms && e.sel) blit(e.sel, ms);
+    const [px, mk] = await Promise.all([new Readback(gl, small.fb, 0, 0, w, h).wait(), ms ? new Readback(gl, ms.fb, 0, 0, w, h).wait() : Promise.resolve(null)]);
+    freeTarget(gl, small); if (ms) freeTarget(gl, ms);
+    const H = [0, 1, 2, 3].map(() => new Float32Array(256));
+    for (let i = 0; i < px.length; i += 4) {
+      const a = px[i + 3]; if (a < 4) continue;
+      const wt = (a / 255) * (mk ? mk[i] / 255 : 1); if (wt <= 0) continue;
+      const r = Math.min(255, Math.round(px[i] * 255 / a)), g = Math.min(255, Math.round(px[i + 1] * 255 / a)), b = Math.min(255, Math.round(px[i + 2] * 255 / a));
+      H[0][Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b)] += wt; H[1][r] += wt; H[2][g] += wt; H[3][b] += wt;
+    }
+    return H;
   }
   private prog(k: string) { let p = this.progs.get(k); if (!p) { p = this.e.program(FS[k]); this.progs.set(k, p); } return p; }
   private scratch(): [Target, Target] {

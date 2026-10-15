@@ -220,17 +220,37 @@ export async function readGesso(blob: Blob, fallbackName = 'Imported'): Promise<
   const img = xml.querySelector('image');
   if (!img) throw new Error('Not an OpenRaster or Gesso file');
   const w = +(img.getAttribute('w') || 0), h = +(img.getAttribute('h') || 0);
-  const nodes = [...xml.querySelectorAll('layer')].reverse(); // ORA lists top first
+  // Nested stacks (M5) become layer groups. ORA lists children top first and a stack's x/y offsets its
+  // children; Gesso's flat order is bottom first with each group header just above its members.
   const layers: GessoDoc['layers'] = [];
   let n = 0;
-  for (const el of nodes) {
-    const src = el.getAttribute('src'); if (!src || !z.has(src)) continue;
-    const x = +(el.getAttribute('x') || 0), y = +(el.getAttribute('y') || 0);
+  const uid = () => 'ora' + n++ + Math.random().toString(36).slice(2, 6);
+  const common = (el: Element) => {
     const op = ORA_OPS.indexOf(el.getAttribute('composite-op') || 'svg:src-over');
-    layers.push({
-      props: { uid: 'ora' + n++ + Math.random().toString(36).slice(2, 6), name: el.getAttribute('name') || 'Layer ' + n, visible: el.getAttribute('visibility') !== 'hidden', opacity: el.hasAttribute('opacity') ? +el.getAttribute('opacity')! : 1, blend: Math.max(0, op), alphaLock: el.getAttribute('alpha-preserve') === 'true', clip: false },
-      png: await get(src), offset: { x, y },
-    });
-  }
+    const o = el.hasAttribute('opacity') ? +el.getAttribute('opacity')! : 1;
+    return { visible: el.getAttribute('visibility') !== 'hidden', opacity: Number.isFinite(o) ? Math.max(0, Math.min(1, o)) : 1, blend: Math.max(0, op) };
+  };
+  const walk = async (stack: Element, parent: string | null, ox: number, oy: number, depth: number) => {
+    const kids = [...stack.children].filter((c) => c.tagName === 'layer' || c.tagName === 'stack').reverse();
+    for (const el of kids) {
+      const x = ox + +(el.getAttribute('x') || 0), y = oy + +(el.getAttribute('y') || 0);
+      if (el.tagName === 'stack') {
+        if (depth >= 8) { await walk(el, parent, x, y, depth); continue; }   // flatten absurd nesting into the parent
+        const g = uid(), before = layers.length;
+        await walk(el, g, x, y, depth + 1);
+        if (layers.length === before) continue;                                // empty stack: no group
+        layers.push({ props: { uid: g, name: el.getAttribute('name') || 'Group', ...common(el), alphaLock: false, clip: false, group: true, parent, collapsed: false }, png: new Uint8Array(0) });
+        continue;
+      }
+      const src = el.getAttribute('src'); if (!src || !z.has(src)) continue;
+      layers.push({
+        props: { uid: uid(), name: el.getAttribute('name') || 'Layer ' + (n + 1), ...common(el), alphaLock: el.getAttribute('alpha-preserve') === 'true', clip: false, parent },
+        png: await get(src), offset: { x, y },
+      });
+    }
+  };
+  const root = xml.querySelector('image > stack');
+  if (!root) throw new Error('Not an OpenRaster or Gesso file');
+  await walk(root, null, 0, 0, 0);
   return { name: fallbackName, w, h, bg: [1, 1, 1], bgVisible: false, active: layers.length - 1, layers };
 }

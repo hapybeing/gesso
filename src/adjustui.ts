@@ -19,6 +19,8 @@ const CURVE_COLOURS = ['#eee', '#ff5a5a', '#5ad16a', '#5a9bff'];
 
 export class AdjustUI implements Grab {
   s: AdjustSession | null = null;
+  /** histogram of the session's original pixels (curves), computed once per session */
+  hist: Float32Array[] | null = null;
   bar: HTMLElement | null = null;
   private raf = 0;
   private last: { x: number; y: number } | null = null;
@@ -40,6 +42,7 @@ export class AdjustUI implements Grab {
     const e = this.host.engine;
     if (this.s) this.close(true);
     if (e.activeLayer.group) { this.host.toast('Pick a layer (not a group) to adjust'); return; }
+    this.hist = null;
     this.s = new AdjustSession(e, kind, defaultParams(kind));
     if (kind === 'liquify') this.host.input.grab = this;
     this.bar = h('div', { id: 'adjbar' });
@@ -135,6 +138,26 @@ export class AdjustUI implements Grab {
       g.fillStyle = 'rgba(0,0,0,.35)'; g.fillRect(0, 0, W, W);
       g.strokeStyle = 'rgba(255,255,255,.12)'; g.lineWidth = 1;
       for (let i = 1; i < 4; i++) { g.beginPath(); g.moveTo(i * W / 4, 0); g.lineTo(i * W / 4, W); g.moveTo(0, i * W / 4); g.lineTo(W, i * W / 4); g.stroke(); }
+      if (hist) {
+        // input histogram (filled) of the channel being edited, and the output histogram it maps to (outline),
+        // both scaled by the 99.5th-percentile bin so one spike (flat background) does not flatten the rest
+        const c = ch(), src = hist[c];
+        const m = curveLut(curves()[0]), lc = c ? curveLut(curves()[c]) : null;
+        const out = new Float32Array(256);
+        for (let i = 0; i < 256; i++) { let v = m[i]; if (lc) v = lc[Math.round(v * 255)]; out[Math.round(v * 255)] += src[i]; }
+        const top = (a: Float32Array) => { const s2 = [...a].sort((x, y) => x - y); return Math.max(1e-6, s2[Math.floor(255 * 0.995)]); };
+        const pk = Math.max(top(src), top(out));
+        const ht = (v: number) => Math.min(1, Math.sqrt(v / pk)) * W * 0.9;
+        const path = (a: Float32Array) => { g.beginPath(); g.moveTo(0, W); for (let i = 0; i < 256; i++) g.lineTo(i / 255 * W, W - ht(a[i])); g.lineTo(W, W); };
+        // input as bars (a flat colour shows as a visible spike, not a hairline)
+        g.fillStyle = c ? CURVE_COLOURS[c] : '#fff'; g.globalAlpha = 0.3;
+        const bw = W / 256 + 0.7;
+        for (let i = 0; i < 256; i++) if (src[i] > 0) { const hh = Math.max(1, ht(src[i])); g.fillRect(i / 256 * W, W - hh, bw, hh); }
+        // the output only once the curve actually moves something
+        let moved = false; for (let i = 0; i < 256 && !moved; i++) if (src[i] > 0 && out[i] !== src[i]) moved = true;
+        if (moved) { g.globalAlpha = 0.6; g.strokeStyle = c ? CURVE_COLOURS[c] : '#fff'; g.lineWidth = 1; g.setLineDash([3, 3]); path(out); g.stroke(); g.setLineDash([]); }
+        g.globalAlpha = 1;
+      }
       curves().forEach((pts, c) => {
         const lut = curveLut(pts);
         g.strokeStyle = CURVE_COLOURS[c]; g.globalAlpha = c === ch() ? 1 : 0.35; g.lineWidth = c === ch() ? 2 : 1;
@@ -143,6 +166,8 @@ export class AdjustUI implements Grab {
       g.globalAlpha = 1; g.fillStyle = CURVE_COLOURS[ch()];
       for (const [x, y] of curves()[ch()]) { g.beginPath(); g.arc(x * W, (1 - y) * W, 6, 0, Math.PI * 2); g.fill(); }
     };
+    let hist: Float32Array[] | null = this.hist;
+    if (!hist) s.histogram().then((hh) => { if (this.s !== s) return; this.hist = hist = hh; draw(); }).catch(() => {});
     let drag = -1;
     const at = (ev: PointerEvent) => { const r = cv.getBoundingClientRect(); return [(ev.clientX - r.left) / r.width, 1 - (ev.clientY - r.top) / r.height] as [number, number]; };
     cv.onpointerdown = (ev) => {

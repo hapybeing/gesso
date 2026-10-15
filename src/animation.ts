@@ -4,6 +4,7 @@
 // holds and FPS stay exact even when a display frame is dropped.
 import type { Engine, Layer, DrawItem } from './engine';
 import { h } from './dom';
+import { dragSort } from './dragsort';
 
 export type PlayMode = 'loop' | 'pingpong' | 'oneshot';
 export interface AnimState {
@@ -256,15 +257,23 @@ export class Animator {
     e.deleteLayer();
     const after = this.frames(); if (after.length) this.goto(Math.min(cur, after.length - 1));
   }
-  moveFrame(d: -1 | 1) {
-    const e = this.e; const fr = this.frames(); const cur = this.current(fr); const to = cur + d;
-    if (cur < 0 || to < 0 || to >= fr.length) return;
-    // swap whole units (frame + its clipping layers): the upper unit's layers move down to the lower unit's base
-    const a = fr[cur], b = fr[to];
-    const [lower, upper] = d > 0 ? [a, b] : [b, a];
-    const target = e.layers.indexOf(lower.base);
+  moveFrame(d: -1 | 1) { const cur = this.current(); this.moveFrameTo(cur, cur + d); }
+  /** move frame `from` to position `to` (frame indices), one undo step; units = frame + its clipping layers */
+  moveFrameTo(from: number, to: number) {
+    const e = this.e; let fr = this.frames();
+    if (from < 0 || from >= fr.length || to < 0 || to >= fr.length || from === to) return;
+    const a = fr[from];
     e.history.beginGroup();
-    [upper.base, ...upper.clips].forEach((l, k) => e.moveLayer(e.layers.indexOf(l), target + k));
+    for (let i = from; i !== to; i += to > from ? 1 : -1) {
+      fr = this.frames();
+      const cur = fr.indexOf(fr.find((f) => f.base === a.base)!), nb = cur + (to > from ? 1 : -1);
+      // swap adjacent units: the upper unit's layers move down to the lower unit's base
+      const b = fr[nb];
+      const [lower, upper] = to > from ? [fr[cur], b] : [b, fr[cur]];
+      const target = lower.base.group ? e.blockOf(lower.base)[0] : e.layers.indexOf(lower.base);
+      const ul = upper.base.group ? e.layers.slice(e.blockOf(upper.base)[0], e.blockOf(upper.base)[1] + 1) : [upper.base, ...upper.clips];
+      ul.forEach((l, k) => e.moveLayer(e.layers.indexOf(l), target + k));
+    }
     e.history.endGroup('Move frame');
     e.active = e.layers.indexOf(a.base);
     this.apply();
@@ -319,6 +328,8 @@ export class Animator {
       grp.append(grip);
       strip.append(grp);
     });
+    dragSort({ scroller: strip, axis: 'x', items: () => [...strip.querySelectorAll<HTMLElement>('.tl-unit')],
+      onDrop: (from, to) => { if (this.playing) this.stop(); this.moveFrameTo(from, to > from ? to - 1 : to); } });
     strip.append(h('button', { class: 'tl-add', title: 'New frame', 'aria-label': 'New frame', onClick: () => this.addFrame() }, '+'));
     const info = h('div', { class: 'tl-info muted' }, `${cur + 1}/${fr.length}`, h('br'), `${this.st.fps} fps · ${(total / this.st.fps).toFixed(1)} s`);
     bar.append(ctl, strip, info);

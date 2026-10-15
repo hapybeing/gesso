@@ -11,6 +11,7 @@ import { TextTool } from './texttool';
 import { ReferenceWindow } from './reference';
 import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
+import { dragSort, DRAG_STATS } from './dragsort';
 import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
 import { Animator, AnimState } from './animation';
 import { exportSheet, exportAnimation } from './animexport';
@@ -22,6 +23,7 @@ import { TransformTool, homography } from './transformtool';
 import { SelectTool, SelKind } from './selecttool';
 import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
+import { Guides, GuideKind, GUIDE_LABEL, defaultGuides, GuideAssist, GuideHandle, guideHandleAt, dragGuideHandle, drawGuides, rulerAngle } from './guides';
 import type { Shape } from './quickshape';
 import { dabsAlong } from './stroke';
 import type { Dab } from './engine';
@@ -64,6 +66,7 @@ const ICON = {
   select: '<path d="M4 8V5.5A1.5 1.5 0 015.5 4H8M12 4h2M18 4h.5A1.5 1.5 0 0120 5.5V8M20 12v2M20 18v.5a1.5 1.5 0 01-1.5 1.5H16M12 20h-2M6 20h-.5A1.5 1.5 0 014 18.5V16M4 12v-2"/>',
   transform: '<path d="M12 3v18M3 12h18"/><path d="M9.5 5.5L12 3l2.5 2.5M9.5 18.5L12 21l2.5-2.5M5.5 9.5L3 12l2.5 2.5M18.5 9.5L21 12l-2.5 2.5"/>',
   film: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M7.5 5v14M16.5 5v14M3.5 9.5h4M3.5 14.5h4M16.5 9.5h4M16.5 14.5h4"/>',
+  guide: '<path d="M3 21L21 3"/><path d="M3 9h6M3 15h12M9 3v6M15 3v12" stroke-dasharray="2 2.2"/><path d="M14 21h7v-7"/>',
   symmetry: '<path d="M12 3v18" stroke-dasharray="2 2.2"/><path d="M9 6.5C5.5 7.5 4 10 4 12.5S6 18 9 17.5z"/><path d="M15 6.5c3.5 1 5 3.5 5 6s-2 5.5-5 5z"/>',
   text: '<path d="M5 6.5V5h14v1.5M12 5v14M9 19h6"/>',
   adjust: '<path d="M4 20l10-10"/><path d="M15.5 4.5l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z"/><path d="M19.5 11l.4 1 1 .4-1 .4-.4 1-.4-1-1-.4 1-.4z"/><path d="M14 10l-2-2"/>',
@@ -127,9 +130,14 @@ class App {
   ovDirty = true;
   shapes: ShapeTool;
   /** an on-canvas handle grabbed by the current pointer */
-  capture: { kind: 'shape'; i: number } | { kind: 'symC' | 'symR' } | null = null;
+  capture: { kind: 'shape'; i: number } | { kind: 'symC' | 'symR' } | { kind: 'guide'; h: GuideHandle; prev: { x: number; y: number } } | null = null;
   sym: Symmetry = defaultSymmetry(1, 1);
   symBar: HTMLElement | null = null;
+  /** drawing guides (grid / isometric / perspective / ruler) and the current stroke's assist */
+  guides: Guides = defaultGuides(1, 1);
+  guideBar: HTMLElement | null = null;
+  assist: GuideAssist | null = null;
+  private assistPending = false;
   xform: TransformTool | null = null;
   selTool: SelectTool | null = null;
   adj!: AdjustUI;
@@ -254,13 +262,16 @@ class App {
   }
 
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym }, timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st } }; }
+  docExtra(): Record<string, unknown> { return { symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st } }; }
   applyDocExtra(x: Record<string, unknown>) {
     this.anim.load(x.anim as Partial<AnimState> | undefined);
     $('#bAnim')?.classList.toggle('on', this.anim.on);
     const s = x.symmetry as Partial<Symmetry> | undefined;
     this.sym = { ...defaultSymmetry(this.engine.w, this.engine.h), ...(s || {}) };
     this.updateSymButton(); if (this.symBar) this.renderSymBar(); this.ovDirty = true;
+    const gd = x.guides as Partial<Guides> | undefined;
+    this.guides = { ...defaultGuides(this.engine.w, this.engine.h), ...(gd || {}) };
+    this.guidesChanged(false);
   }
 
   showGallery() {
@@ -405,6 +416,10 @@ class App {
   settle() { this.shapes.commit(); this.xform?.finish(true); this.selTool?.closePoly(); if (this.adj?.active) this.adj.close(true); }
 
   captureAt(sx: number, sy: number) {
+    if (this.guideBar) {
+      const hd = guideHandleAt(this.guides, this.engine, sx, sy);
+      if (hd) { const d = this.engine.screenToDoc(sx, sy); this.capture = { kind: 'guide', h: hd, prev: d }; return true; }
+    }
     if (this.symBar && this.sym.mode !== 'off') {
       const hd = guideHandles(this.sym, this.engine);
       const c = this.engine.docToScreen(hd.c.x, hd.c.y), r = this.engine.docToScreen(hd.r.x, hd.r.y);
@@ -435,7 +450,12 @@ class App {
     const preset = BRUSHES.find((b) => b.id === brush.id);
     this.builder = new StrokeBuilder(brush, { curve: this.curve, viewScale: this.engine.view.scale, sizeRatio: preset ? brush.size / preset.size : 1 });
     this.lastBuilder = this.builder;
-    this.engine.addDabs(this.expand(this.builder.start(s)));
+    // drawing assist holds the first few px back until the stroke's direction picks a guide line
+    this.assist = new GuideAssist(this.guides, this.engine);
+    const first = tool === 'smudge' ? [s] : this.assist.begin(s);
+    if (tool === 'smudge') this.assist = null;
+    this.assistPending = !first.length;
+    if (first.length) this.engine.addDabs(this.expand(this.builder.start(first[0])));
     const b = this.builder;
     if (tool !== 'smudge' && this.state.settings.snapShapes) this.shapes.strokeBegan(() => b.raw);
     return true;
@@ -448,9 +468,17 @@ class App {
       const st = Math.PI / 12, sa = Math.round(a / st) * st; if (Math.abs(sa - a) < 0.05) a = sa; // detents every 15°
       this.sym.angle = a; this.symChanged(); return;
     }
+    if (this.capture?.kind === 'guide') { dragGuideHandle(this.guides, this.capture.h, last, this.capture.prev); this.capture.prev = { x: last.x, y: last.y }; this.guidesChanged(); return; }
     if (this.shapes.dragging) { this.shapes.dragTo(last); return; }
     if (this.shapes.phase === 'hold') { this.shapes.holdMove(last); return; }
     if (!this.builder) return;
+    if (this.assist) {
+      const wasLocked = !!this.assist.line;
+      samples = this.assist.add(samples);
+      if (!wasLocked && this.assist.line) this.ovDirty = true;
+      if (!samples.length) return;
+      if (this.assistPending) { this.assistPending = false; this.engine.addDabs(this.expand(this.builder.start(samples[0]))); samples = samples.slice(1); }
+    }
     const dabs: Dab[] = [];
     for (const s of samples) dabs.push(...this.builder.add(s));
     this.engine.addDabs(this.expand(dabs));
@@ -468,7 +496,7 @@ class App {
   strokePredict(s: Sample[]) {
     const st = this.state.settings;
     this.predStats.moves++;
-    if (!st.predict || !this.builder || this.strokeTool !== 'brush' || this.shapes.phase === 'hold' || this.sym.mode !== 'off' && this.sym.assist) { if (this.pred) this.clearPrediction(); return; }
+    if (!st.predict || !this.builder || this.strokeTool !== 'brush' || this.shapes.phase === 'hold' || this.sym.mode !== 'off' && this.sym.assist || (this.assist && !this.assist.free)) { if (this.pred) this.clearPrediction(); return; }
     if (s.length) { this.predStats.withPrediction++; const a = this.lastRaw, b = s[s.length - 1]; if (a) this.predStats.aheadPx += Math.hypot(b.x - a.x, b.y - a.y) * this.engine.view.scale; }
     this.pred = s; this.ovDirty = true;
   }
@@ -493,6 +521,14 @@ class App {
     if (this.shapes.phase === 'hold') { this.shapes.holdEnd(); this.builder = null; return; }
     this.shapes.strokeEnded();
     if (!this.builder) return;
+    if (this.assist) {
+      // lifted before the direction was read: a dot or a tiny mark, drawn as it was
+      const rest = this.assist.flush();
+      if (this.assistPending && rest.length) { this.engine.addDabs(this.expand(this.builder.start(rest[0]))); for (const r of rest.slice(1)) this.engine.addDabs(this.expand(this.builder.add(r))); }
+      this.assistPending = false;
+      if (this.assist.line) this.ovDirty = true;
+      this.assist = null;
+    }
     const { added, full } = this.builder.finish();
     this.engine.addDabs(this.expand(added));
     if (full) this.engine.redrawStroke(this.expand(full));
@@ -507,11 +543,52 @@ class App {
     return expandDabs(dabs, this.sym);
   }
 
+  // ---------------------------------------------------------------- drawing guides
+  guidesChanged(save = true) {
+    this.ovDirty = true; if (save) this.autosave.touch();
+    $('#bGuide')?.classList.toggle('on', this.guides.kind !== 'off');
+    if (this.guideBar) this.renderGuideBar();
+  }
+  toggleGuideBar() {
+    this.settle(); this.closePop();
+    if (this.guideBar) { this.guideBar.remove(); this.guideBar = null; this.ovDirty = true; return; }
+    if (this.symBar) this.toggleSymBar();
+    this.guideBar = h('div', { id: 'guidebar', class: 'toolbar-float' });
+    document.body.append(this.guideBar);
+    if (this.guides.kind === 'off') this.guides.kind = 'grid';
+    this.guidesChanged();
+  }
+  renderGuideBar() {
+    const bar = this.guideBar!; const gd = this.guides, e = this.engine;
+    bar.innerHTML = '';
+    const chip = (label: string, on: boolean, fn: () => void, title?: string) => h('button', { class: 'chip' + (on ? ' on' : ''), title: title || label, onClick: fn }, label);
+    const kinds: GuideKind[] = ['off', 'grid', 'iso', 'persp', 'ruler'];
+    bar.append(h('div', { class: 'chips' }, ...kinds.map((k) => chip(GUIDE_LABEL[k], gd.kind === k, () => { gd.kind = k; this.guidesChanged(); }))));
+    const row = h('div', { class: 'chips' });
+    if (gd.kind === 'grid' || gd.kind === 'iso' || gd.kind === 'persp' && gd.points < 3) {
+      const r = h('input', { type: 'range', min: 8, max: Math.round(Math.min(e.w, e.h) / 3), value: gd.size, class: 'edge-range', 'aria-label': 'Grid size' }) as HTMLInputElement;
+      const out = h('b', { class: 'edge-val' }, gd.size + ' px');
+      r.oninput = () => { gd.size = +r.value; out.textContent = gd.size + ' px'; this.ovDirty = true; };
+      r.onchange = () => this.guidesChanged();
+      row.append(h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, gd.kind === 'persp' ? 'Verticals' : 'Size'), r, out));
+    }
+    if (gd.kind === 'persp') row.append(...([1, 2, 3] as const).map((n) => chip(n + '-point', gd.points === n, () => { gd.points = n; this.guidesChanged(); })));
+    if (gd.kind === 'ruler') row.append(chip('Parallel', gd.parallel, () => { gd.parallel = !gd.parallel; this.guidesChanged(); }, 'Every stroke runs parallel to the ruler'), h('span', { class: 'muted small' }, rulerAngle(gd) + '°'));
+    if (row.childNodes.length) bar.append(row);
+    bar.append(h('div', { class: 'chips' },
+      chip('Drawing assist', gd.assist, () => { gd.assist = !gd.assist; this.guidesChanged(); }, 'Strokes snap to the guide (starts more than 35° off any guide line stay free)'),
+      chip('Reset', false, () => { const d = defaultGuides(e.w, e.h); Object.assign(gd, { ...d, kind: gd.kind, assist: gd.assist }); this.guidesChanged(); }),
+      h('button', { class: 'btn small', onClick: () => this.toggleGuideBar() }, 'Done')));
+    if (gd.kind === 'persp') bar.append(h('div', { class: 'muted small' }, 'Drag the numbered points (zoom out to reach ones off the canvas)'));
+    if (gd.kind === 'ruler') bar.append(h('div', { class: 'muted small' }, 'Drag the ends or ✥; strokes started on its edge run along it'));
+  }
+
   symChanged() { this.ovDirty = true; this.autosave.touch(); this.updateSymButton(); if (this.symBar) this.renderSymBar(); }
   updateSymButton() { $('#bSym')?.classList.toggle('on', this.sym.mode !== 'off'); }
   toggleSymBar() {
     this.settle(); this.closePop();
     if (this.symBar) { this.symBar.remove(); this.symBar = null; this.ovDirty = true; return; }
+    if (this.guideBar) this.toggleGuideBar();
     this.symBar = h('div', { id: 'symbar' });
     document.body.append(this.symBar);
     if (this.sym.mode === 'off') { this.sym.mode = 'vertical'; this.symChanged(); }
@@ -668,6 +745,7 @@ class App {
     g.clearRect(0, 0, c.width, c.height);
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     drawGuide(g, this.engine, this.sym, !!this.symBar);
+    drawGuides(g, this.engine, this.guides, !!this.guideBar, this.assist?.line ?? null);
     this.shapes.drawOverlay(g);
     this.xform?.drawOverlay(g);
     this.selTool?.drawOverlay(g);
@@ -761,6 +839,7 @@ class App {
       tb('tEraser', ICON.eraser, 'Erase', () => this.pickTool('eraser')),
       tb('bAnim', ICON.film, 'Animation', () => { this.closePop(); this.anim.toggle(); $('#bAnim').classList.toggle('on', this.anim.on); }),
       tb('bSym', ICON.symmetry, 'Symmetry', () => this.toggleSymBar()),
+      tb('bGuide', ICON.guide, 'Drawing guides', () => this.toggleGuideBar()),
       tb('bLayers', ICON.layers, 'Layers', () => this.togglePop('layers', this.renderLayers)),
       h('button', { id: 'bColor', class: 'swatch', title: 'Colour', 'aria-label': 'Colour', onClick: () => this.togglePop('color', this.renderColor) }),
     );
@@ -1064,6 +1143,35 @@ class App {
   }
 
   // ---------------------------------------------------------------- layers
+  /**
+   * Long-press drop in the layers list: move a layer (or a whole group) so that it sits just above the row
+   * `below` (null = the bottom). Done as single steps of moveBlock, so group membership follows the same rules
+   * as the arrows (entering an expanded group, leaving at its edge); one undo step.
+   */
+  dropLayer(l: Layer, below: Layer | null) {
+    const e = this.engine;
+    const rows = () => { const out: Layer[] = []; const f = (x: Layer) => { for (let p = x.parent; p; p = p.parent) if (p.collapsed) return true; return false; };
+      for (let i = e.layers.length - 1; i >= 0; i--) if (!f(e.layers[i])) out.push(e.layers[i]); return out; };
+    // the row directly below l's block in display order
+    const rowBelow = () => { const r = rows();
+      const idx = r.indexOf(l); let k = idx + 1; while (k < r.length && e.isInside(r[k], l)) k++; return r[k] ?? null; };
+    const pos = (x: Layer | null) => x ? rows().indexOf(x) : rows().length;
+    if (below && (below === l || e.isInside(below, l))) return;
+    e.history.beginGroup();
+    let first: 1 | -1 | 0 = 0;
+    for (let n = 0; n < e.layers.length * 3 && rowBelow() !== below; n++) {
+      const dir: 1 | -1 = pos(below) <= pos(l) ? 1 : -1;
+      if (first && dir !== first) break;   // overshot an unreachable spot (group edge): stay at the nearest
+      first = dir;
+      const before = e.layers.map((x) => x.id + ':' + (x.parent?.id ?? '')).join();
+      e.moveBlock(l, dir);
+      if (e.layers.map((x) => x.id + ':' + (x.parent?.id ?? '')).join() === before) break;
+    }
+    e.history.endGroup('Move layer');
+    e.active = e.layers.indexOf(l);
+    this.renderLayers();
+  }
+
   renderLayers(el: HTMLElement = this.pop!) {
     if (!el) return;
     const e = this.engine;
@@ -1076,9 +1184,11 @@ class App {
       h('button', { class: 'ib small', title: 'New layer', onClick: () => { if (!e.addLayer()) this.toast('Not enough memory for another layer'); } }, svg(ICON.plus))));
     const list = h('div', { class: 'llist' });
     const folded = (l: Layer) => { for (let p = l.parent; p; p = p.parent) if (p.collapsed) return true; return false; };
+    const shown: Layer[] = [];   // rows in display order (top first), for long-press reordering
     for (let i = e.layers.length - 1; i >= 0; i--) {
       const l = e.layers[i];
       if (folded(l)) continue;
+      shown.push(l);
       const depth = e.depthOf(l);
       if (l.group) {
         const n = e.membersOf(l, true).filter((x) => !x.group).length;
@@ -1103,6 +1213,8 @@ class App {
       h('button', { class: 'ib small', onClick: () => e.setBackground(null, !e.bgVisible) }, svg(e.bgVisible ? ICON.eye : ICON.eyeOff)));
     list.append(bgRow);
     el.append(list);
+    dragSort({ scroller: list, axis: 'y', items: () => [...list.querySelectorAll<HTMLElement>('.lrow:not(.bg)')],
+      onDrop: (from, to) => { this.dropLayer(shown[from], shown[to] ?? null); } });
     // active layer controls
     const l = e.activeLayer;
     const op = h('input', { type: 'range', min: 0, max: 100, value: Math.round(l.opacity * 100) }) as HTMLInputElement;
@@ -1449,4 +1561,4 @@ if ('serviceWorker' in navigator && location.protocol === 'https:') {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 (window as any).gesso = new App();
-(window as any).gessoTest = { brushes: { brushFile, parseBrushFile, addCustomBrushes, BRUSHES }, loadClip, exportClip, selectFrames, homography, exportAnimation, GifSession, buildPalette };
+(window as any).gessoTest = { DRAG_STATS, brushes: { brushFile, parseBrushFile, addCustomBrushes, BRUSHES }, loadClip, exportClip, selectFrames, homography, exportAnimation, GifSession, buildPalette };

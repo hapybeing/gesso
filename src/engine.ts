@@ -366,8 +366,21 @@ export class Engine {
     this.setStrokeUniforms(p, null);
     const pool = this.pool;
     type Region = { x: number; y: number; w: number; h: number; lr?: TileRef; cr?: TileRef };
+    const groupClips = new Map<Layer, Target>();
     for (const it of items) {
       const l = it.layer, clipBase = it.clipBase;
+      // clipping onto a group: render the group's members (isolated, 100 %) inside this rect, once per pass
+      let clipTex: Target | null = null;
+      if (clipBase && clipBase.group) {
+        clipTex = groupClips.get(clipBase) ?? null;
+        if (!clipTex) {
+          const [ca, cb] = this.groupBuffers(20 + depth * 2);
+          bindTarget(gl, ca); gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+          clipTex = this.compositeItems(this.buildItems(clipBase), r, ca, cb, 21 + depth * 2);
+          groupClips.set(clipBase, clipTex);
+          p.use(); this.setStrokeUniforms(p, null);
+        }
+      }
       if (it.children) {
         // isolated group: its members composited into a transparent buffer pair, then drawn as one layer
         const [ga, gb] = this.groupBuffers(depth);
@@ -383,7 +396,7 @@ export class Engine {
         continue;
       }
       // resident layers draw in one pass; tiled ones only where they (and their clipping base) have tiles
-      const lt = l.res ? null : l.tiles, ct = clipBase && !clipBase.res ? clipBase.tiles : null;
+      const lt = l.res ? null : l.tiles, ct = clipBase && !clipTex && !clipBase.res ? clipBase.tiles : null;
       let regions: Region[] | null = null;
       if (lt || ct) {
         regions = [];
@@ -408,7 +421,8 @@ export class Engine {
       if (l.res) p.tex('uLayer', 1, l.res.tex).f('uLayerMap', 1, 1, 0, 0);
       p.i('uMode', it.blend ?? l.blend).f('uOpacity', it.opacity);
       const t = it.tint; p.f('uTint', t ? t[0] : 0, t ? t[1] : 0, t ? t[2] : 0, t ? t[3] : 0);
-      if (clipBase) {
+      if (clipTex) { p.tex('uClip', 2, clipTex.tex).f('uClipMap', 1, 1, 0, 0).i('uClipMode', 1); }
+      else if (clipBase) {
         if (clipBase.res) p.tex('uClip', 2, clipBase.res.tex).f('uClipMap', 1, 1, 0, 0);
         p.i('uClipMode', this.cur && this.cur.layer === clipBase && this.cur.tool !== 'smudge' ? 2 : 1);
         if (this.cur && this.cur.layer === clipBase && this.cur.layer !== l) {
@@ -455,9 +469,10 @@ export class Engine {
     let clipBase: Layer | null = null;
     for (const l of this.layers) {
       if (l.parent !== parent) continue;
-      if (l.group) { clipBase = null; if (l.visible && l.opacity > 0) out.push(...this.groupItems(l)); continue; }
+      // a group is a clipping base too (M5): layers clipped onto it are masked by the group's combined alpha
+      if (l.group) { clipBase = l; if (l.visible && l.opacity > 0) out.push(...this.groupItems(l)); continue; }
       if (!l.clip) clipBase = l;
-      const clipped = l.clip && clipBase && clipBase !== l;   // a layer clipped onto a group draws unclipped
+      const clipped = l.clip && clipBase && clipBase !== l;
       if (!l.visible || l.opacity <= 0) continue;
       if (clipped && !clipBase!.visible) continue;
       out.push({ layer: l, opacity: l.opacity, clipBase: clipped ? clipBase : null });
@@ -1030,26 +1045,53 @@ export class Engine {
     this.history.push({ label, bytes: this.bytesPerLayer(), undo: swap, redo: swap, dispose: () => held.dispose() });
   }
 
+  /**
+   * Whole-layer edit whose undo holds only the tiles that had paint (M5): the layer's pixels are detached as a
+   * sparse tile map (pointer move, no copy when the tiles are in sync), the new pixels are rendered from it,
+   * and undo/redo swap tile maps. Clearing a layer with a small sketch on a 4096² canvas keeps a few 256²
+   * tiles instead of a 64 MB full-canvas copy. make(src) returns the new texture, or null for an empty layer.
+   */
+  tileEdit(layer: Layer, label: string, make: (src: Target) => Target | null) {
+    this.settleWet();
+    const pool = this.pool;
+    const before = pool.takeTiles(layer);
+    const next = make(pool.readableTiles(before));
+    if (next) layer.target = next;
+    layer.version++;
+    this.changed();
+    let held = before;
+    const tileBytes = (m: Map<number, TileRef>) => m.size * TILE * TILE * 4;
+    const swap = () => {
+      const now = pool.takeTiles(layer);
+      layer.version++;
+      pool.putTiles(layer, held);
+      held = now;
+      this.changed();
+    };
+    this.history.push({ label, bytes: Math.max(64, tileBytes(before)), undo: swap, redo: swap, dispose: () => pool.freeTiles(held) });
+  }
+
   /** clear the layer, or only the selected pixels when there is a selection */
   clearLayer() {
     if (this.activeLayer.group) return;
-    if (this.sel) { this.replaceTarget(this.activeLayer, this.selop(this.activeLayer, 1), 'Clear selection'); return; }
-    this.replaceTarget(this.activeLayer, this.newTarget(), 'Clear layer');
+    if (this.sel) { this.tileEdit(this.activeLayer, 'Clear selection', (src) => this.selop(src, 1)); return; }
+    this.tileEdit(this.activeLayer, 'Clear layer', () => null);
   }
 
   /** fill the layer (or the selection) with a colour, honouring alpha lock */
   fillLayer(rgb: [number, number, number]) {
     const layer = this.activeLayer;
     if (layer.group) return;
-    this.replaceTarget(layer, this.selop(layer, 0, rgb), this.sel ? 'Fill selection' : 'Fill layer');
+    this.tileEdit(layer, this.sel ? 'Fill selection' : 'Fill layer', (src) => this.selop(src, 0, rgb, layer.alphaLock));
   }
 
-  /** run SELOP on a layer into a new target */
-  private selop(layer: Layer, mode: 0 | 1 | 2 | 3, rgb: [number, number, number] = [0, 0, 0]): Target {
+  /** run SELOP on a layer (or a texture of its pixels) into a new target */
+  private selop(layer: Layer | Target, mode: 0 | 1 | 2 | 3, rgb: [number, number, number] = [0, 0, 0], lock = layer instanceof Layer ? layer.alphaLock : false): Target {
     const gl = this.gl, t = this.newTarget();
+    const tex = layer instanceof Layer ? layer.target.tex : layer.tex;
     bindTarget(gl, t); gl.disable(gl.BLEND);
-    this.pSelop.use().tex('uLayer', 0, layer.target.tex).tex('uSel', 1, this.sel ? this.sel.tex : null)
-      .i('uUseSel', this.sel ? 1 : 0).i('uMode', mode).i('uLock', layer.alphaLock ? 1 : 0).f('uColor', ...rgb);
+    this.pSelop.use().tex('uLayer', 0, tex).tex('uSel', 1, this.sel ? this.sel.tex : null)
+      .i('uUseSel', this.sel ? 1 : 0).i('uMode', mode).i('uLock', lock ? 1 : 0).f('uColor', ...rgb);
     this.drawQuad();
     return t;
   }
