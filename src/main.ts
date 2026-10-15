@@ -565,13 +565,17 @@ class App {
     const kinds: GuideKind[] = ['off', 'grid', 'iso', 'persp', 'ruler'];
     bar.append(h('div', { class: 'chips' }, ...kinds.map((k) => chip(GUIDE_LABEL[k], gd.kind === k, () => { gd.kind = k; this.guidesChanged(); }))));
     const row = h('div', { class: 'chips' });
-    if (gd.kind === 'grid' || gd.kind === 'iso' || gd.kind === 'persp' && gd.points < 3) {
+    const op = h('input', { type: 'range', min: 15, max: 100, value: Math.round(gd.opacity * 100), class: 'edge-range', 'aria-label': 'Guide opacity' }) as HTMLInputElement;
+    op.oninput = () => { gd.opacity = +op.value / 100; this.ovDirty = true; };
+    op.onchange = () => this.guidesChanged();
+    if (gd.kind === 'grid' || gd.kind === 'iso') {
       const r = h('input', { type: 'range', min: 8, max: Math.round(Math.min(e.w, e.h) / 3), value: gd.size, class: 'edge-range', 'aria-label': 'Grid size' }) as HTMLInputElement;
       const out = h('b', { class: 'edge-val' }, gd.size + ' px');
       r.oninput = () => { gd.size = +r.value; out.textContent = gd.size + ' px'; this.ovDirty = true; };
       r.onchange = () => this.guidesChanged();
-      row.append(h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, gd.kind === 'persp' ? 'Verticals' : 'Size'), r, out));
+      row.append(h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, 'Size'), r, out));
     }
+    if (gd.kind !== 'off') row.append(h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, 'Opacity'), op));
     if (gd.kind === 'persp') row.append(...([1, 2, 3] as const).map((n) => chip(n + '-point', gd.points === n, () => { gd.points = n; this.guidesChanged(); })));
     if (gd.kind === 'ruler') row.append(chip('Parallel', gd.parallel, () => { gd.parallel = !gd.parallel; this.guidesChanged(); }, 'Every stroke runs parallel to the ruler'), h('span', { class: 'muted small' }, rulerAngle(gd) + '°'));
     if (row.childNodes.length) bar.append(row);
