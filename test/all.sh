@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run the browser tests; fail if any reports console errors or exits non-zero.
 # The whole suite takes ~9 min under SwiftShader, so it is split into groups that each fit a 2-minute shell:
-#   test/all.sh 1 … test/all.sh 11     (no argument = everything); GESSO_T=<s> raises the per-test timeout
+#   test/all.sh 1 … test/all.sh 12     (no argument = everything); GESSO_T=<s> raises the per-test timeout
 #   (the shared CI box can be 10× slower than an idle one — run groups in the background there)
 cd "$(dirname "$0")/.." || exit 1
 case "$1" in
@@ -15,8 +15,9 @@ case "$1" in
   9) set -- m5a ;;
   10) set -- guides ;;
   11) set -- fill palette ;;
+  12) set -- animpro ;;
   8) set -- feel text ;;
-  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust wet feel text m5a guides fill palette ;;
+  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust wet feel text m5a guides fill palette animpro ;;
 esac
 fail=0
 [ "$1" = run ] && { node test/quickshape-unit.cjs | tail -1 || fail=1; }

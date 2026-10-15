@@ -7,10 +7,11 @@ import { gifEncoder, pngEncode } from './workerclient';
 import { gifDelays } from './gif';
 import { zipWrite } from './gessofile';
 import { h } from './dom';
+import { encodeAudio } from './animaudio';
 
 export type AnimFormat = 'gif' | 'mp4' | 'webm' | 'png';
-export interface AnimExportOpts { format: AnimFormat; maxSide: number; repeat: number; dither: boolean; transparent: boolean; }
-export interface AnimExportResult { blob: Blob; ext: string; w: number; h: number; frames: number; seconds: number; ms: number; codec?: string; }
+export interface AnimExportOpts { format: AnimFormat; maxSide: number; repeat: number; dither: boolean; transparent: boolean; /** mux the audio track into MP4/WebM (default on when there is one) */ audio?: boolean; }
+export interface AnimExportResult { blob: Blob; ext: string; w: number; h: number; frames: number; seconds: number; ms: number; codec?: string; audioCodec?: string; }
 
 export async function exportAnimation(anim: Animator, e: Engine, o: AnimExportOpts, progress: (t: number) => void = () => {}): Promise<AnimExportResult> {
   const t0 = performance.now();
@@ -63,7 +64,15 @@ export async function exportAnimation(anim: Animator, e: Engine, o: AnimExportOp
     const { track, samples } = await writer.finish();
     // the cycle starts on a keyframe, so repeats can reuse its samples unchanged
     const all = Array.from({ length: Math.max(1, o.repeat) }, () => samples).flat();
-    return done(mux(o.format, track, all), o.format, all.length, cfg.codec);
+    // audio as heard in playback: restarted every cycle, rendered for every repeat, then encoded once
+    let at = null;
+    if (o.audio !== false && anim.audio?.ready) {
+      const buf = await anim.audio.render(seconds, Math.max(1, o.repeat));
+      at = buf ? await encodeAudio(buf, o.format) : null;
+    }
+    const r = done(mux(o.format, track, all, at ?? undefined), o.format, all.length, cfg.codec);
+    r.audioCodec = at?.info.codec;
+    return r;
   } catch (err) { writer.close(); throw err; }
 }
 
@@ -82,6 +91,7 @@ export function exportSheet(body: HTMLElement, anim: Animator, e: Engine, save: 
       h('section', {}, h('h4', {}, 'Format'), seg<AnimFormat>([['gif', 'GIF'], ['mp4', 'MP4'], ['webm', 'WebM'], ['png', 'PNG frames (.zip)']], o.format, (v) => { o.format = v; try { localStorage.setItem('gesso.animfmt', v); } catch { /* */ } })),
       h('section', {}, h('h4', {}, 'Size (longest side)'), seg<number>(sizes, o.maxSide, (v) => { o.maxSide = v; })),
       o.format === 'mp4' || o.format === 'webm' ? h('section', {}, h('h4', {}, 'Repeat'), seg<number>([[1, 'Once'], [2, '×2'], [4, '×4'], [8, '×8']], o.repeat, (v) => { o.repeat = v; }), h('p', { class: 'muted' }, 'Short loops play better on social apps when repeated. Repeats cost no extra encoding.')) : null,
+      (o.format === 'mp4' || o.format === 'webm') && anim.audio?.ready ? h('section', {}, h('h4', {}, 'Audio'), seg<number>([[1, 'Include “' + anim.audio.meta!.name + '”'], [0, 'Silent']], o.audio === false ? 0 : 1, (v) => { o.audio = !!v; })) : null,
       o.format === 'gif' ? h('section', {}, h('h4', {}, 'Colours'), seg<number>([[1, 'Dithered (smooth gradients)'], [0, 'Flat (crisp, smaller)']], o.dither ? 1 : 0, (v) => { o.dither = !!v; }), anim.st.fps > 50 ? h('p', { class: 'muted' }, 'GIF timing tops out at 50 fps; faster animations will play at 50.') : null) : null,
       o.format === 'gif' || o.format === 'png' ? h('section', {}, h('h4', {}, 'Background'), seg<number>([[0, 'Include background'], [1, 'Transparent']], o.transparent ? 1 : 0, (v) => { o.transparent = !!v; })) : null,
     ].filter(Boolean) as HTMLElement[]);

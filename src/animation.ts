@@ -5,6 +5,7 @@
 import type { Engine, Layer, DrawItem } from './engine';
 import { h } from './dom';
 import { dragSort } from './dragsort';
+import { AnimAudio, drawWave } from './animaudio';
 
 export type PlayMode = 'loop' | 'pingpong' | 'oneshot';
 export interface AnimState {
@@ -23,8 +24,10 @@ export interface AnimState {
   roles: Record<string, 'bg' | 'fg'>;
   /** light-table pins: frames always shown faintly */
   pins: string[];
+  /** hidden layers are frames too (off: hidden layers are left out, as before) */
+  includeHidden: boolean;
 }
-export const defaultAnim = (): AnimState => ({ on: false, fps: 12, mode: 'loop', onionBefore: 2, onionAfter: 1, onionOpacity: 0.45, tint: 'redgreen', blendPrimary: false, onionWrap: false, lightOpacity: 0.3, holds: {}, roles: {}, pins: [] });
+export const defaultAnim = (): AnimState => ({ on: false, fps: 12, mode: 'loop', onionBefore: 2, onionAfter: 1, onionOpacity: 0.45, tint: 'redgreen', blendPrimary: false, onionWrap: false, lightOpacity: 0.3, holds: {}, roles: {}, pins: [], includeHidden: false });
 const TINTS: Record<AnimState['tint'], [[number, number, number], [number, number, number]] | null> = {
   off: null,
   redgreen: [[0.86, 0.22, 0.2], [0.16, 0.6, 0.3]],
@@ -40,6 +43,10 @@ export interface AnimHost {
   openExport(): void;
   layerLimit(): void;
   layout(): void;               // the timeline appeared/disappeared: refit the canvas
+  /** the artwork's audio track (M5.5) */
+  audio?: AnimAudio;
+  /** pick and import an audio file */
+  importAudio?(): void;
 }
 
 export class Animator {
@@ -77,8 +84,9 @@ export class Animator {
     for (const l of this.e.layers) {
       if (l.parent) continue;                 // a group is one frame: its members are drawn with it
       if (this.st.roles[l.uid]) continue;
-      if (l.clip && !l.group && out.length && l.visible && !out[out.length - 1].base.group) { out[out.length - 1].clips.push(l); continue; }
-      if (!l.visible || l.clip) continue;
+      const vis = l.visible || this.st.includeHidden;
+      if (l.clip && !l.group && out.length && vis && !out[out.length - 1].base.group) { out[out.length - 1].clips.push(l); continue; }
+      if (!vis || l.clip) continue;
       out.push({ base: l, clips: [] });
     }
     return out;
@@ -103,6 +111,11 @@ export class Animator {
     for (let i = fr.length - 2; i >= 1; i--) for (let k = 0; k <= this.hold(fr[i].base); k++) back.push(i);
     return fwd.concat(back);
   }
+  /** first display tick of frame i in the forward order (its time = tickStart / fps) */
+  tickStart(i: number, fr = this.frames()) { let t = 0; for (let j = 0; j < i && j < fr.length; j++) t += this.hold(fr[j].base) + 1; return t; }
+  /** seconds in one cycle of the play mode */
+  cycleSeconds(fr = this.frames()) { return this.ticks(fr).length / this.st.fps; }
+  get audio() { return this.host.audio; }
   /** runs of [frame, ticks] for export */
   runs(fr = this.frames()): [number, number][] {
     const out: [number, number][] = [];
@@ -172,9 +185,11 @@ export class Animator {
   /** the current frame for the time-lapse (no onion skins) */
   captureList(): DrawItem[] | undefined { if (!this.st.on) return undefined; const fr = this.frames(); return this.list(this.current(fr), false, fr); }
 
-  goto(i: number) {
+  goto(i: number, scrub = false) {
     const fr = this.frames(); if (!fr.length) return;
     i = Math.max(0, Math.min(fr.length - 1, i));
+    // frame stepping plays that frame's slice of the audio (for lip-sync)
+    if (scrub && !this.playing && this.audio?.ready) this.audio.scrub(this.tickStart(i, fr) / this.st.fps, (this.hold(fr[i].base) + 1) / this.st.fps);
     this.e.active = this.e.layers.indexOf(fr[i].base);
     this.lastFrame = fr[i].base.uid;
     this.apply();
@@ -184,7 +199,7 @@ export class Animator {
     const fr = this.frames(); if (!fr.length) return;
     const n = fr.length; let i = this.current(fr) + d;
     i = this.st.mode === 'oneshot' ? Math.max(0, Math.min(n - 1, i)) : ((i % n) + n) % n;
-    this.goto(i);
+    this.goto(i, true);
   }
 
   // ---------------------------------------------------------------- playback
@@ -202,6 +217,10 @@ export class Animator {
     const t = this.ticks(fr), cur = this.current(fr);
     const startTick = Math.max(0, t.indexOf(cur));
     this.t0 = performance.now() - (startTick * 1000) / this.st.fps;
+    // audio starts with the picture; the picture waits for the output latency so lips land on the sound
+    const au = this.audio?.ready ? this.audio : null;
+    if (au) { au.playFrom(startTick / this.st.fps, (t.length - startTick) / this.st.fps); this.t0 += au.latency() * 1000; }
+    let cycle = 0;
     this.shownTick = -1;
     this.stats = { shown: 0, late: 0 };
     const loop = () => {
@@ -210,7 +229,9 @@ export class Animator {
       const ft = this.frames(), tt = this.ticks(ft);
       let k = Math.floor(((performance.now() - this.t0) * this.st.fps) / 1000);
       if (this.st.mode === 'oneshot' && k >= tt.length) { this.stop(); this.goto(tt[tt.length - 1]); return; }
-      k = k % tt.length;
+      const cyc = Math.floor(Math.max(0, k) / tt.length);
+      if (cyc !== cycle) { cycle = cyc; if (au) au.playFrom(0, tt.length / this.st.fps); }   // every cycle restarts the sound
+      k = ((k % tt.length) + tt.length) % tt.length;
       if (k === this.shownTick) return;
       if (this.shownTick >= 0 && k !== (this.shownTick + 1) % tt.length) this.stats.late++;
       const prevFrame = this.shownTick >= 0 ? tt[this.shownTick] : -1;
@@ -227,6 +248,7 @@ export class Animator {
   stop() {
     if (!this.playing) return;
     this.playing = false; cancelAnimationFrame(this.raf);
+    this.audio?.stop();
     this.shownTick = -1;
     this.apply();
   }
@@ -244,10 +266,12 @@ export class Animator {
   duplicateFrame() {
     const e = this.e; const fr = this.frames(); const cur = this.current(fr); if (cur < 0) return;
     e.active = e.layers.indexOf(fr[cur].base);
-    const hold = this.hold(fr[cur].base);
+    const hold = this.hold(fr[cur].base), before = this.timing();
+    e.history.beginGroup();
     const l = e.duplicateLayer();
+    if (l && hold) { this.st.holds[l.uid] = hold; this.recordTiming('Hold', before); }
+    e.history.endGroup('Duplicate frame');
     if (!l) { this.host.layerLimit(); return; }
-    if (hold) this.st.holds[l.uid] = hold;
     this.lastFrame = l.uid; this.apply(); this.host.changed();
   }
   deleteFrame() {
@@ -278,9 +302,20 @@ export class Animator {
     e.active = e.layers.indexOf(a.base);
     this.apply();
   }
-  setHold(l: Layer, n: number) { n = Math.max(0, Math.min(120, Math.round(n))); if (n) this.st.holds[l.uid] = n; else delete this.st.holds[l.uid]; this.apply(); this.host.changed(); }
-  setRole(l: Layer, r: 'bg' | 'fg' | null) { if (r) this.st.roles[l.uid] = r; else delete this.st.roles[l.uid]; this.apply(); this.host.changed(); }
-  togglePin(l: Layer) { const i = this.st.pins.indexOf(l.uid); if (i >= 0) this.st.pins.splice(i, 1); else this.st.pins.push(l.uid); this.apply(); this.host.changed(); }
+  // Holds, under/over roles and pins are undo steps (R3 debt): each edit snapshots the three maps before and after.
+  private timing() { return JSON.stringify({ holds: this.st.holds, roles: this.st.roles, pins: this.st.pins }); }
+  private restoreTiming(j: string) { const t = JSON.parse(j); this.st.holds = t.holds; this.st.roles = t.roles; this.st.pins = t.pins; this.barKey = ''; this.apply(); this.host.changed(); }
+  /** push one undo step for a timing edit; `before` from timing() taken before the change */
+  recordTiming(label: string, before: string) {
+    const after = this.timing(); if (after === before) return;
+    this.e.history.push({ label, bytes: 64 + before.length + after.length, undo: () => this.restoreTiming(before), redo: () => this.restoreTiming(after) });
+  }
+  setHold(l: Layer, n: number) {
+    const b = this.timing(); n = Math.max(0, Math.min(120, Math.round(n))); if (n) this.st.holds[l.uid] = n; else delete this.st.holds[l.uid];
+    this.recordTiming('Hold', b); this.apply(); this.host.changed();
+  }
+  setRole(l: Layer, r: 'bg' | 'fg' | null) { const b = this.timing(); if (r) this.st.roles[l.uid] = r; else delete this.st.roles[l.uid]; this.recordTiming(r ? (r === 'bg' ? 'Show under every frame' : 'Show over every frame') : 'Make frame', b); this.apply(); this.host.changed(); }
+  togglePin(l: Layer) { const b = this.timing(); const i = this.st.pins.indexOf(l.uid); if (i >= 0) this.st.pins.splice(i, 1); else this.st.pins.push(l.uid); this.recordTiming(i >= 0 ? 'Unpin' : 'Pin', b); this.apply(); this.host.changed(); }
   set<K extends keyof AnimState>(k: K, v: AnimState[K]) { this.st[k] = v; if (this.playing && k === 'fps') { this.stop(); this.play(); } this.apply(); this.host.changed(); }
 
   // ---------------------------------------------------------------- timeline UI
@@ -298,7 +333,8 @@ export class Animator {
   renderBar() {
     const bar = this.bar; if (!bar) return;
     const fr = this.frames(), cur = this.current(fr);
-    const key = JSON.stringify([fr.map((f) => [f.base.uid, this.hold(f.base), this.st.pins.includes(f.base.uid)]), cur, this.playing, this.st.fps, this.st.mode, this.e.w, this.e.h]);
+    const au = this.audio?.ready ? this.audio : null;
+    const key = JSON.stringify([fr.map((f) => [f.base.uid, this.hold(f.base), this.st.pins.includes(f.base.uid)]), cur, this.playing, this.st.fps, this.st.mode, this.e.w, this.e.h, au ? [au.meta!.offset, au.meta!.muted, au.duration] : 0]);
     if (key === this.barKey) { this.updateThumbs(); return; }
     this.barKey = key;
     bar.innerHTML = '';
@@ -307,23 +343,33 @@ export class Animator {
       h('button', { class: 'ib', title: this.playing ? 'Pause' : 'Play', 'aria-label': this.playing ? 'Pause' : 'Play', onClick: () => this.togglePlay() }, icon(this.playing ? 'M8 5v14M16 5v14' : 'M7 4.5v15l12.5-7.5z')),
       h('button', { class: 'ib', title: 'Animation settings', 'aria-label': 'Animation settings', onClick: () => this.openSettings() }, icon('M4 7h10M18 7h2M4 17h4M12 17h8M16 4v6M10 14v6')),
     );
-    const strip = h('div', { class: 'tl-strip' });
+    if (this.audio) ctl.append(h('button', { class: 'ib' + (au ? ' on' : ''), title: au ? 'Audio · ' + au.meta!.name : 'Add audio (lip-sync)', 'aria-label': 'Audio', onClick: (ev: Event) => this.openAudio(ev.currentTarget as HTMLElement) }, icon('M9 18V6l10-2v12M9 18a3 3 0 11-6 0 3 3 0 016 0zm10-2a3 3 0 11-6 0 3 3 0 016 0z')));
+    const strip = h('div', { class: 'tl-strip' + (au ? ' has-audio' : '') });
+    let tick = 0;
     const tw = 64, th = Math.max(28, Math.min(64, Math.round((tw * this.e.h) / this.e.w)));
     fr.forEach((f, i) => {
       const t = this.thumbFor(f.base, tw, th);
       const hold = this.hold(f.base);
       const cell = h('div', { class: 'tl-cell' + (i === cur ? ' on' : '') + (this.st.pins.includes(f.base.uid) ? ' pinned' : ''), 'data-i': String(i) },
         t, h('span', { class: 'tl-num' }, String(i + 1)));
-      cell.onclick = () => { if (this.playing) this.stop(); if (i === cur) this.openFrameOptions(cell, f); else this.goto(i); };
+      cell.onclick = () => { if (this.playing) this.stop(); if (i === cur) this.openFrameOptions(cell, f); else this.goto(i, true); };
       const grp = h('div', { class: 'tl-unit' }, cell);
       if (hold) grp.append(h('div', { class: 'tl-hold', style: `width:${Math.min(240, hold * 12)}px`, title: `Held for ${hold + 1} frames` }, h('span', {}, '+' + hold)));
+      if (au) {
+        // the sound heard while this frame is on screen, under the frame (and its hold)
+        const t0 = tick / this.st.fps, t1 = (tick + hold + 1) / this.st.fps, off = au.meta!.offset;
+        const wv = h('canvas', { class: 'tl-wave', height: 32 }) as HTMLCanvasElement;
+        grp.append(wv);
+        requestAnimationFrame(() => { const w = Math.max(8, cell.offsetWidth + ((grp.querySelector('.tl-hold') as HTMLElement | null)?.offsetWidth ?? 0) - 2); wv.width = w * 2; wv.style.width = w + 'px'; drawWave(wv, au.peaks!, t0 + off, t1 + off); });
+      }
+      tick += hold + 1;
       // drag the grip sideways to change the hold (12 px per frame)
       const grip = h('div', { class: 'tl-grip', title: 'Drag to hold this frame longer' });
       grip.onpointerdown = (ev) => {
         ev.stopPropagation(); grip.setPointerCapture(ev.pointerId);
-        const x0 = ev.clientX, h0 = hold;
+        const x0 = ev.clientX, h0 = hold, before = this.timing();
         grip.onpointermove = (m) => { const n = Math.max(0, h0 + Math.round((m.clientX - x0) / 12)); if (n !== this.hold(f.base)) { this.st.holds[f.base.uid] = n; if (!n) delete this.st.holds[f.base.uid]; const hd = grp.querySelector('.tl-hold') as HTMLElement | null; if (hd) { hd.style.width = Math.min(240, n * 12) + 'px'; hd.firstElementChild!.textContent = '+' + n; } } };
-        grip.onpointerup = () => { grip.onpointermove = null; this.barKey = ''; this.apply(); this.host.changed(); };
+        grip.onpointerup = grip.onpointercancel = () => { grip.onpointermove = null; this.recordTiming('Hold', before); this.barKey = ''; this.apply(); this.host.changed(); };
       };
       grp.append(grip);
       strip.append(grp);
@@ -392,6 +438,42 @@ export class Animator {
     draw();
   }
 
+  /** audio track: import / replace, shift, volume, mute, scrub, remove */
+  openAudio(anchor: HTMLElement | null) {
+    const a = this.audio; if (!a) return;
+    const p = this.popAt(anchor, 'asettings');
+    const draw = () => {
+      p.innerHTML = '';
+      const m = a.ready ? a.meta! : null, fps = this.st.fps;
+      p.append(h('div', { class: 'pop-head' }, h('b', {}, 'Audio'), m ? h('span', { class: 'muted' }, m.name) : ''));
+      if (!m) {
+        p.append(h('p', { class: 'muted' }, 'Add a voice line or music to time the animation to it. Its waveform shows under each frame for exactly the time that frame is on screen; stepping frames plays that slice so mouth shapes land on the syllables. Exported with MP4 and WebM.'),
+          h('div', { class: 'chips' }, h('button', { class: 'btn small', onClick: () => { this.closePop(); this.host.importAudio?.(); } }, 'Import audio…')));
+        return;
+      }
+      const shiftF = Math.round(m.offset * fps * 100) / 100;
+      const set = (k: 'offset' | 'volume', v: number) => { m[k] = v; a.applyVolume(); this.barKey = ''; this.apply(); this.host.changed(); };
+      const nudge = (df: number) => h('button', { class: 'chip', onClick: () => { set('offset', Math.round((m.offset - df / fps) * 1e6) / 1e6); draw(); } }, df < 0 ? '◀ ' + -df : df + ' ▶');
+      const vol = h('input', { type: 'range', min: '0', max: '100', value: String(Math.round(m.volume * 100)) }) as HTMLInputElement;
+      const vv = h('b', { class: 'fo-val' }, Math.round(m.volume * 100) + '%');
+      vol.oninput = () => { vv.textContent = vol.value + '%'; set('volume', +vol.value / 100); };
+      p.append(
+        h('p', { class: 'muted' }, `${a.duration.toFixed(2)} s of audio · ${this.cycleSeconds().toFixed(2)} s of animation per cycle`),
+        h('h4', {}, 'Sync'),
+        h('div', { class: 'fo-row' }, h('span', {}, 'Shift'), nudge(-1), h('b', { class: 'fo-val' }, (shiftF > 0 ? '−' : shiftF < 0 ? '+' : '') + Math.abs(shiftF) + ' fr'), nudge(1),
+          h('span', { class: 'muted' }, `${Math.round(-m.offset * 1000)} ms`)),
+        h('p', { class: 'muted small' }, '◀ makes the sound come earlier, ▶ later.'),
+        h('label', { class: 'srow' }, h('span', {}, 'Volume'), vol, vv),
+        h('div', { class: 'chips' },
+          h('button', { class: 'chip' + (m.muted ? ' on' : ''), onClick: () => { m.muted = !m.muted; a.applyVolume(); this.barKey = ''; this.apply(); this.host.changed(); draw(); } }, 'Mute'),
+          h('button', { class: 'chip' + (m.scrub ? ' on' : ''), title: 'Play each frame’s slice of sound when you step or tap frames', onClick: () => { m.scrub = !m.scrub; this.host.changed(); draw(); } }, 'Hear frames when stepping'),
+          h('button', { class: 'chip', onClick: () => { this.closePop(); this.host.importAudio?.(); } }, 'Replace…'),
+          h('button', { class: 'chip danger-text', onClick: () => { void a.remove().then(() => { this.barKey = ''; this.apply(); this.host.changed(); }); this.closePop(); } }, 'Remove')),
+      );
+    };
+    draw();
+  }
+
   openSettings() {
     const p = this.popAt(null, 'asettings');
     const draw = () => {
@@ -410,6 +492,7 @@ export class Animator {
         seg<PlayMode>([['loop', 'Loop'], ['pingpong', 'Ping-pong'], ['oneshot', 'One shot']], s.mode, (v) => this.set('mode', v)),
         range('Frames per second', 1, 60, 1, s.fps, (v) => v + ' fps', (v) => this.set('fps', v)),
         h('div', { class: 'chips' }, ...[6, 8, 12, 15, 24, 30].map((f) => h('button', { class: 'chip' + (s.fps === f ? ' on' : ''), onClick: () => { this.set('fps', f); draw(); } }, String(f)))),
+        h('div', { class: 'chips' }, h('button', { class: 'chip' + (s.includeHidden ? ' on' : ''), title: 'Hidden layers become frames too (off: hiding a layer takes it out of the animation)', onClick: () => { this.set('includeHidden', !s.includeHidden); this.barKey = ''; this.apply(); draw(); } }, 'Include hidden layers')),
         h('h4', {}, 'Onion skin'),
         range('Frames before', 0, 12, 1, s.onionBefore, (v) => String(v), (v) => this.set('onionBefore', v)),
         range('Frames after', 0, 12, 1, s.onionAfter, (v) => String(v), (v) => this.set('onionAfter', v)),

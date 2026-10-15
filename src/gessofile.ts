@@ -161,6 +161,10 @@ export interface GessoDoc {
   layers: { props: LayerProps; png: Uint8Array; offset?: { x: number; y: number } }[];   // bottom to top
   merged?: Uint8Array; thumb?: Uint8Array;
   extra?: Record<string, unknown>;
+  /** extra stored entries (time-lapse, audio) written as-is under gesso/ */
+  files?: { name: string; data: Uint8Array }[];
+  /** on read: lazy access to every entry (for those extras) */
+  zip?: Map<string, () => Promise<Uint8Array>>;
 }
 
 const ORA_OPS = ['svg:src-over', 'svg:multiply', 'svg:screen', 'svg:overlay', 'svg:darken', 'svg:lighten', 'svg:color-dodge', 'svg:color-burn',
@@ -198,6 +202,7 @@ export async function writeGesso(doc: GessoDoc, encodeImg: (px: Uint8Array, w: n
   }
   if (doc.merged) entries.push({ name: 'mergedimage.png', data: doc.merged });
   if (doc.thumb) entries.push({ name: 'Thumbnails/thumbnail.png', data: doc.thumb });
+  for (const f of doc.files || []) entries.push({ name: f.name, data: f.data });
   return zipWrite(entries);
 }
 
@@ -213,7 +218,7 @@ export async function readGesso(blob: Blob, fallbackName = 'Imported'): Promise<
         group: !!l.group, parent: l.parent ?? null, collapsed: !!l.collapsed, text: l.text ?? undefined },
       png: l.group || !l.file ? new Uint8Array(0) : await get(l.file),
     })));
-    return { name: m.name || fallbackName, w: m.width | 0, h: m.height | 0, bg: m.background || [1, 1, 1], bgVisible: m.backgroundVisible !== false, active: m.active | 0, layers, extra: m.extra || {} };
+    return { name: m.name || fallbackName, w: m.width | 0, h: m.height | 0, bg: m.background || [1, 1, 1], bgVisible: m.backgroundVisible !== false, active: m.active | 0, layers, extra: m.extra || {}, zip: z };
   }
   // plain OpenRaster
   const xml = new DOMParser().parseFromString(dec.decode(await get('stack.xml')), 'application/xml');

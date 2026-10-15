@@ -1,6 +1,6 @@
 // WebCodecs helpers: codec choice, an encoder that collects samples, decoding of stored clips (sequential and
 // seekable), and a transcode pipeline (decode → pick frames → re-encode) with back-pressure.
-import { Sample, TrackInfo, muxMP4, muxWebM, canMux } from './mux';
+import { Sample, TrackInfo, AudioTrack, muxMP4, muxWebM, canMux } from './mux';
 
 export const hasWebCodecs = () => typeof VideoEncoder !== 'undefined' && typeof VideoDecoder !== 'undefined' && typeof VideoFrame !== 'undefined';
 
@@ -86,7 +86,7 @@ export function toBytes(b: AllowSharedBufferSource): Uint8Array {
   return new Uint8Array((b as ArrayBuffer).slice(0));
 }
 
-export function mux(fmt: 'mp4' | 'webm', track: TrackInfo, samples: Sample[]) { return fmt === 'mp4' ? muxMP4(track, samples) : muxWebM(track, samples); }
+export function mux(fmt: 'mp4' | 'webm', track: TrackInfo, samples: Sample[], audio?: AudioTrack) { return fmt === 'mp4' ? muxMP4(track, samples, audio) : muxWebM(track, samples, audio); }
 export { canMux };
 
 // ------------------------------------------------------------------ stored clips

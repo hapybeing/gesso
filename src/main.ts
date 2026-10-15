@@ -12,7 +12,7 @@ import { ReferenceWindow } from './reference';
 import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
 import { dragSort, DRAG_STATS } from './dragsort';
-import { TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
+import { packTimelapse, unpackTimelapse, TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
 import { Animator, AnimState } from './animation';
 import { exportSheet, exportAnimation } from './animexport';
 import { GifSession, buildPalette } from './gif';
@@ -24,6 +24,7 @@ import { SelectTool, SelKind } from './selecttool';
 import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
 import { FillTool, FillSettings, FillRef, defaultFill } from './filltool';
+import { AnimAudio, AudioMeta } from './animaudio';
 import { PaletteLibrary, Palette, cleanPalette } from './palette';
 import { PaletteHost, paletteSection, DOC as DOC_PAL } from './paletteui';
 import { Guides, GuideKind, GUIDE_LABEL, defaultGuides, GuideAssist, GuideHandle, guideHandleAt, dragGuideHandle, drawGuides, rulerAngle } from './guides';
@@ -144,6 +145,8 @@ class App {
   /** palette library (localStorage) and the palette carried by the open artwork */
   palettes = new PaletteLibrary();
   docPalette: Palette | null = null;
+  /** the animation's audio track */
+  audio = new AnimAudio();
   palHost!: PaletteHost;
   /** uid of the layer marked as the fill reference (per artwork) */
   refUid: string | null = null;
@@ -222,8 +225,9 @@ class App {
       changed: () => { $('#bText')?.classList.toggle('on', this.text.active); this.updateUndoButtons(); }, overlayChanged: () => { this.ovDirty = true; } });
     this.ref = new ReferenceWindow({ engine: this.engine, setColor: (c) => this.setColor(c), toast: (m) => this.toast(m) });
     this.autosave.blocked = () => !!this.xform || this.shapes.active || this.adj.active || !!this.text.layer;
+    this.audio.onChange = () => { this.anim?.renderBar(); };
     this.anim = new Animator({
-      engine: this.engine,
+      engine: this.engine, audio: this.audio, importAudio: () => this.importAudio(),
       toast: (m) => this.toast(m),
       changed: () => { this.autosave.touch(); $('#bAnim')?.classList.toggle('on', this.anim.on); },
       openExport: () => this.showAnimExport(),
@@ -236,7 +240,9 @@ class App {
     this.autosave.onAttach = (meta, clean) => {
       const x = (meta.extra?.timelapse || {}) as { on?: boolean };
       this.tl.attach(meta.id, x.on !== false);
-      if (!clean) this.tl.request(1); // a new or imported artwork: its starting state is frame 0
+      void this.audio.attach(meta.id, (meta.extra?.audio as AudioMeta | undefined) ?? null);
+      if (!clean && !this.tlImported) this.tl.request(1); // a new or imported artwork: its starting state is frame 0
+      this.tlImported = 0;
     };
     this.autosave.onDetach = () => this.tl.detach();
     window.addEventListener('paste', (ev) => {
@@ -287,8 +293,31 @@ class App {
     return true;
   }
 
+  /** frames of time-lapse that came inside an imported file (the recorder continues them) */
+  tlImported = 0;
+  /** extra zip entries for .gesso (audio) */
+  extraFiles(): { name: string; data: Uint8Array }[] { return this.audio.ready && this.audio.bytes ? [{ name: 'gesso/audio', data: this.audio.bytes }] : []; }
+  /** audio bytes inside an imported file (set on the document once it has an id) */
+  private pendingAudio: { bytes: Uint8Array; meta: AudioMeta } | null = null;
+  async readExtraFiles(zip: Map<string, () => Promise<Uint8Array>>, extra: Record<string, unknown>) {
+    const f = zip.get('gesso/audio'), m = extra.audio as AudioMeta | undefined;
+    this.pendingAudio = f && m ? { bytes: await f(), meta: m } : null;
+  }
+  /** pick an audio file for the animation */
+  importAudio() {
+    const inp = h('input', { type: 'file', accept: 'audio/*,video/mp4,video/webm,.mp3,.m4a,.aac,.wav,.ogg,.oga,.opus,.flac,.webm' }) as HTMLInputElement;
+    inp.onchange = async () => {
+      const f = inp.files?.[0]; if (!f) return;
+      if (f.size > 60 * 1024 * 1024) { this.toast('That file is over 60 MB — trim it first'); return; }
+      try {
+        await this.audio.set(new Uint8Array(await f.arrayBuffer()), f.name.replace(/\.[^.]+$/, '').slice(0, 40) || 'Audio', f.type || 'audio/*');
+        this.autosave.touch(); this.toast(`Audio added · ${this.audio.duration.toFixed(1)} s`);
+      } catch { this.toast('This browser cannot decode that audio file — try MP3, M4A or WAV'); }
+    };
+    inp.click();
+  }
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st }, palette: this.docPalette }; }
+  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st }, palette: this.docPalette, audio: this.audio.meta }; }
   applyDocExtra(x: Record<string, unknown>) {
     this.anim.load(x.anim as Partial<AnimState> | undefined);
     $('#bAnim')?.classList.toggle('on', this.anim.on);
@@ -359,9 +388,15 @@ class App {
       this.engine.loadDocument(doc.w, doc.h, doc.bg, doc.bgVisible, layers, doc.active);
       layers.forEach((l) => l.image?.close());
       this.applyDocExtra(doc.extra || {});
-      const now = Date.now();
-      const meta: DocMeta = { id: newDocId(), name: doc.name, w: doc.w, h: doc.h, bg: doc.bg, bgVisible: doc.bgVisible, layers: [], active: doc.active, created: now, modified: now };
+      const now = Date.now(), id = newDocId();
+      // a recording inside the file goes into storage before the recorder attaches (it then continues it)
+      this.tlImported = doc.zip ? await unpackTimelapse(doc.zip, id).catch((err) => { this.toast('Time-lapse in the file could not be read: ' + (err as Error).message); return 0; }) : 0;
+      this.pendingAudio = null;
+      if (doc.zip) await this.readExtraFiles(doc.zip, doc.extra || {});
+      const meta: DocMeta = { id, name: doc.name, w: doc.w, h: doc.h, bg: doc.bg, bgVisible: doc.bgVisible, layers: [], active: doc.active, created: now, modified: now };
       this.autosave.attach(meta, false);
+      const pa = this.pendingAudio as { bytes: Uint8Array; meta: AudioMeta } | null; this.pendingAudio = null;
+      if (pa) { await this.audio.set(pa.bytes, pa.meta.name, pa.meta.type, pa.meta).catch(() => this.toast('The audio in this file cannot be played here')); }
       localStorage.setItem('gesso.last', meta.id);
       await this.autosave.flush();
       this.thumbVersions.clear(); this.fit(); this.updateUndoButtons(); this.closeGallery();
@@ -382,7 +417,11 @@ class App {
     const tc = await thumbP;
     const tpx = tc.getContext('2d')!.getImageData(0, 0, tc.width, tc.height).data;
     const thumb = await pngEncode(new Uint8Array(tpx.buffer), tc.width, tc.height, false);
-    return writeGesso({ name: this.autosave.meta?.name || 'Untitled', w: e.w, h: e.h, bg: e.bg, bgVisible: e.bgVisible, active: e.active, layers, merged, thumb, extra: this.docExtra() }, (px, w, h) => pngEncode(px, w, h, false));
+    // the time-lapse recording (and the animation's audio) travel inside the file
+    const files: { name: string; data: Uint8Array }[] = [];
+    if (this.autosave.docId) { await this.tl.flush(); files.push(...await packTimelapse(this.autosave.docId)); }
+    files.push(...this.extraFiles());
+    return writeGesso({ files,  name: this.autosave.meta?.name || 'Untitled', w: e.w, h: e.h, bg: e.bg, bgVisible: e.bgVisible, active: e.active, layers, merged, thumb, extra: this.docExtra() }, (px, w, h) => pngEncode(px, w, h, false));
   }
 
   async exportGessoFile(id?: string) {

@@ -26,7 +26,7 @@ export interface TlPack {
   frames: { key: boolean; data: ArrayBuffer; area: number }[];
 }
 
-const DB = 'gesso', VER = 3;
+const DB = 'gesso', VER = 4;
 let dbp: Promise<IDBDatabase> | null = null;
 function db(): Promise<IDBDatabase> {
   if (!dbp) dbp = new Promise((res, rej) => {
@@ -38,6 +38,7 @@ function db(): Promise<IDBDatabase> {
       if (!d.objectStoreNames.contains('thumbs')) d.createObjectStore('thumbs');
       if (!d.objectStoreNames.contains('tiles')) d.createObjectStore('tiles'); // docId/uid/tileIndex -> deflated RGBA
       if (!d.objectStoreNames.contains('tl')) d.createObjectStore('tl'); // time-lapse packs: docId/seq
+      if (!d.objectStoreNames.contains('assets')) d.createObjectStore('assets'); // v4: per-document blobs (audio): docId/name
     };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
@@ -114,9 +115,14 @@ export const store = {
       r.onerror = () => rej(r.error);
     }));
   },
+  /** per-document blobs (the animation's audio): docId/name */
+  putAsset: (docId: string, name: string, b: Blob) => tx(['assets'], 'readwrite', (t) => req(t.objectStore('assets').put(b, docId + '/' + name))).then(() => {}),
+  getAsset: (docId: string, name: string) => tx(['assets'], 'readonly', (t) => req(t.objectStore('assets').get(docId + '/' + name) as IDBRequest<Blob | undefined>)),
+  deleteAsset: (docId: string, name: string) => tx(['assets'], 'readwrite', (t) => req(t.objectStore('assets').delete(docId + '/' + name))).then(() => {}),
   clearTl: (docId: string) => tx(['tl'], 'readwrite', (t) => req(t.objectStore('tl').delete(range(docId)))).then(() => {}),
   async remove(docId: string) {
-    await tx(['docs', 'layers', 'tiles', 'thumbs', 'tl'], 'readwrite', (t) => {
+    await tx(['docs', 'layers', 'tiles', 'thumbs', 'tl', 'assets'], 'readwrite', (t) => {
+      t.objectStore('assets').delete(range(docId));
       t.objectStore('tiles').delete(range(docId));
       t.objectStore('tl').delete(range(docId));
       t.objectStore('docs').delete(docId);
@@ -129,7 +135,11 @@ export const store = {
     if (!m) return null;
     const now = Date.now();
     const copy: DocMeta = { ...structuredClone(m), id: newId, name, created: now, modified: now };
-    await tx(['docs', 'layers', 'tiles', 'thumbs', 'tl'], 'readwrite', async (t) => {
+    await tx(['docs', 'layers', 'tiles', 'thumbs', 'tl', 'assets'], 'readwrite', async (t) => {
+      const as = t.objectStore('assets');
+      const ak = await req(as.getAllKeys(range(docId)));
+      const av = await req(as.getAll(range(docId)));
+      ak.forEach((k, i) => as.put(av[i], newId + String(k).slice(docId.length)));
       const ts = t.objectStore('tiles');
       const tik = await req(ts.getAllKeys(range(docId)));
       const tiv = await req(ts.getAll(range(docId)));

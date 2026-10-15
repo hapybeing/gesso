@@ -501,3 +501,41 @@ export class TimelapseView {
 }
 
 const fmtTime = (s: number) => { s = Math.max(0, Math.round(s)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+
+// ------------------------------------------------------------------ time-lapse inside .gesso (M5.5)
+// The recording travels with the artwork, as the leading iPad app's files do: gesso/timelapse.json (pack index:
+// segment, decoder config, size, per-frame key/area/length) + gesso/timelapse/NNNN.bin (that pack's encoded frames
+// back to back, stored, not deflated — they are already compressed). Older Gesso versions ignore the folder.
+interface TlIndex { version: 1; packs: { seg: number; config: { codec: string; codedWidth: number; codedHeight: number; description?: string } | null; w: number; h: number; frames: { key: boolean; area: number; len: number }[] }[] }
+const b64 = (u: Uint8Array) => { let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s); };
+const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+export async function packTimelapse(docId: string): Promise<{ name: string; data: Uint8Array }[]> {
+  const packs = await store.getTl(docId);
+  if (!packs.length) return [];
+  const idx: TlIndex = { version: 1, packs: [] }, out: { name: string; data: Uint8Array }[] = [];
+  packs.forEach((p, i) => {
+    const total = p.frames.reduce((s, f) => s + f.data.byteLength, 0), bin = new Uint8Array(total); let o = 0;
+    for (const f of p.frames) { bin.set(new Uint8Array(f.data), o); o += f.data.byteLength; }
+    idx.packs.push({ seg: p.seg, w: p.w, h: p.h, config: p.config ? { codec: p.config.codec, codedWidth: p.config.codedWidth, codedHeight: p.config.codedHeight, description: p.config.description ? b64(toBytes(p.config.description)) : undefined } : null,
+      frames: p.frames.map((f) => ({ key: f.key, area: f.area, len: f.data.byteLength })) });
+    out.push({ name: `gesso/timelapse/${String(i).padStart(4, '0')}.bin`, data: bin });
+  });
+  out.unshift({ name: 'gesso/timelapse.json', data: new TextEncoder().encode(JSON.stringify(idx)) });
+  return out;
+}
+/** write a file's recording into storage for a new document id; returns the frame count (0 = none in the file) */
+export async function unpackTimelapse(zip: Map<string, () => Promise<Uint8Array>>, docId: string): Promise<number> {
+  const ix = zip.get('gesso/timelapse.json'); if (!ix) return 0;
+  const idx = JSON.parse(new TextDecoder().decode(await ix())) as TlIndex;
+  if (idx.version !== 1 || !Array.isArray(idx.packs)) return 0;
+  let n = 0;
+  for (let i = 0; i < idx.packs.length; i++) {
+    const p = idx.packs[i], f = zip.get(`gesso/timelapse/${String(i).padStart(4, '0')}.bin`); if (!f) break;
+    const bin = await f(); let o = 0;
+    const frames = p.frames.map((fr) => { const data = bin.slice(o, o + fr.len).buffer as ArrayBuffer; o += fr.len; return { key: !!fr.key, area: +fr.area || 0, data }; });
+    if (o > bin.length) throw new Error('Damaged time-lapse in file');
+    await store.putTl(docId, i, { seg: p.seg | 0, w: p.w | 0, h: p.h | 0, frames, config: p.config ? { codec: String(p.config.codec), codedWidth: p.config.codedWidth | 0, codedHeight: p.config.codedHeight | 0, description: p.config.description ? unb64(p.config.description) : undefined } : null });
+    n += frames.length;
+  }
+  return n;
+}

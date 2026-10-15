@@ -4,6 +4,17 @@
 
 export interface Sample { data: Uint8Array; key: boolean; /** duration in microseconds */ dur: number; }
 export interface TrackInfo { codec: string; width: number; height: number; description?: Uint8Array; }
+/** an optional audio track (M5.5): Opus or AAC packets with durations in samples at `rate` */
+export interface AudioTrackInfo { codec: 'opus' | 'aac'; rate: number; channels: number; /** AAC AudioSpecificConfig */ description?: Uint8Array; /** Opus encoder delay in samples (48 kHz) */ preSkip: number; }
+export interface AudioSample { data: Uint8Array; dur: number; }
+export interface AudioTrack { info: AudioTrackInfo; samples: AudioSample[]; }
+/** OpusHead (RFC 7845), little-endian: WebM CodecPrivate */
+export function opusHead(a: AudioTrackInfo) {
+  const b = new Uint8Array(19), d = new DataView(b.buffer);
+  'OpusHead'.split('').forEach((c, i) => b[i] = c.charCodeAt(0));
+  b[8] = 1; b[9] = a.channels; d.setUint16(10, a.preSkip, true); d.setUint32(12, a.rate, true); d.setInt16(16, 0, true); b[18] = 0;
+  return b;
+}
 
 // ------------------------------------------------------------------ byte writer
 class W {
@@ -34,7 +45,45 @@ function toUnits(samples: Sample[], scale: number) {
   return samples.map((s) => { t += s.dur; const nu = Math.round((t * scale) / 1e6); const d = Math.max(1, nu - u); u += d; return d; });
 }
 
-export function muxMP4(track: TrackInfo, samples: Sample[]): Blob {
+
+const dinf = () => box('dinf', full('dref', 0, 0, new W().u32(1).bytes(full('url ', 0, 1, new Uint8Array(0))).out()));
+function tkhdBox(id: number, ms: number, w: number, h: number, audio: boolean) {
+  const t = new W().u32(0).u32(0).u32(id).u32(0).u32(ms).zeros(8).u16(0).u16(audio ? 1 : 0).u16(audio ? 0x100 : 0).u16(0);
+  for (const m of MATRIX) t.u32(m);
+  t.u32(w << 16).u32(h << 16);
+  return full('tkhd', 0, 3, t.out());
+}
+/** MPEG-4 descriptor: tag, one-byte length (payloads here are < 128 bytes) */
+const desc = (tag: number, body: Uint8Array) => new W().u8(tag).u8(body.length).bytes(body).out();
+/** the audio 'trak': Opus ('Opus' + dOps, edit list skipping the encoder delay) or AAC ('mp4a' + esds) */
+function audioTrak(a: AudioTrack, offset: number, capMs: number) {
+  const { info, samples } = a, TS = info.rate;
+  const total = samples.reduce((s, x) => s + x.dur, 0), play = Math.max(0, total - (info.codec === 'opus' ? info.preSkip : 0));
+  const ms = Math.min(capMs, Math.round((play / TS) * 1000));   // the edit list ends the sound with the picture
+  let cfg: Uint8Array;
+  if (info.codec === 'opus') cfg = box('dOps', new W().u8(0).u8(info.channels).u16(info.preSkip).u32(info.rate).u16(0).u8(0).out());
+  else {
+    const asc = info.description ?? new Uint8Array([0x11, 0x90]);
+    const dcd = desc(0x04, new W().u8(0x40).u8(0x15).u24(0).u32(0).u32(0).bytes(desc(0x05, asc)).out());
+    cfg = full('esds', 0, 0, desc(0x03, new W().u16(2).u8(0).bytes(dcd).bytes(desc(0x06, new Uint8Array([2]))).out()));
+  }
+  const entry = box(info.codec === 'opus' ? 'Opus' : 'mp4a', new W().zeros(6).u16(1).zeros(8).u16(info.channels).u16(16).u16(0).u16(0).u32(info.rate * 65536).out(), cfg);
+  const runs: [number, number][] = [];
+  for (const s of samples) { const r = runs[runs.length - 1]; if (r && r[1] === s.dur) r[0]++; else runs.push([1, s.dur]); }
+  const stts = full('stts', 0, 0, (() => { const w = new W().u32(runs.length); for (const [c, d] of runs) w.u32(c).u32(d); return w.out(); })());
+  const stsc = full('stsc', 0, 0, new W().u32(1).u32(1).u32(samples.length).u32(1).out());
+  const stsz = full('stsz', 0, 0, (() => { const w = new W().u32(0).u32(samples.length); for (const s of samples) w.u32(s.data.length); return w.out(); })());
+  const stco = full('stco', 0, 0, new W().u32(1).u32(offset).out());
+  const stbl = box('stbl', full('stsd', 0, 0, new W().u32(1).bytes(entry).out()), stts, stsc, stsz, stco);
+  const minf = box('minf', full('smhd', 0, 0, new W().u16(0).u16(0).out()), dinf(), stbl);
+  const mdhd = full('mdhd', 0, 0, new W().u32(0).u32(0).u32(TS).u32(total).u16(0x55c4).u16(0).out());
+  const hdlr = full('hdlr', 0, 0, new W().u32(0).str('soun').zeros(12).str('SoundHandler').u8(0).out());
+  const skip = info.codec === 'opus' ? info.preSkip : 0;
+  const edts = box('edts', full('elst', 0, 0, new W().u32(1).u32(ms).u32(skip).u16(1).u16(0).out()));
+  return { trak: box('trak', tkhdBox(2, ms, 0, 0, true), edts, box('mdia', mdhd, hdlr, minf)), ms };
+}
+
+export function muxMP4(track: TrackInfo, samples: Sample[], audio?: AudioTrack): Blob {
   const TS = 90000;
   const durs = toUnits(samples, TS);
   const total = durs.reduce((a, b) => a + b, 0);
@@ -63,31 +112,30 @@ export function muxMP4(track: TrackInfo, samples: Sample[]): Blob {
   const stss = keys.length === samples.length ? null : full('stss', 0, 0, (() => { const w = new W().u32(keys.length); for (const k of keys) w.u32(k); return w.out(); })());
   const stsc = full('stsc', 0, 0, new W().u32(1).u32(1).u32(samples.length).u32(1).out());
   const stsz = full('stsz', 0, 0, (() => { const w = new W().u32(0).u32(samples.length); for (const s of samples) w.u32(s.data.length); return w.out(); })());
+  const vBytes = samples.reduce((s, x) => s + x.data.length, 0);
   const build = (offset: number) => {
     const stco = full('stco', 0, 0, new W().u32(1).u32(offset).out());
     const stbl = box('stbl', ...[stsd, stts, stss, stsc, stsz, stco].filter(Boolean) as Uint8Array[]);
     const vmhd = full('vmhd', 0, 1, new W().zeros(8).out());
-    const dinf = box('dinf', full('dref', 0, 0, new W().u32(1).bytes(full('url ', 0, 1, new Uint8Array(0))).out()));
-    const minf = box('minf', vmhd, dinf, stbl);
+    const minf = box('minf', vmhd, dinf(), stbl);
     const mdhd = full('mdhd', 0, 0, new W().u32(0).u32(0).u32(TS).u32(total).u16(0x55c4).u16(0).out());
     const hdlr = full('hdlr', 0, 0, new W().u32(0).str('vide').zeros(12).str('VideoHandler').u8(0).out());
     const mdia = box('mdia', mdhd, hdlr, minf);
-    const tkhdW = new W().u32(0).u32(0).u32(1).u32(0).u32(totalMs).zeros(8).u16(0).u16(0).u16(0).u16(0);
-    for (const m of MATRIX) tkhdW.u32(m);
-    tkhdW.u32(Wd << 16).u32(Ht << 16);
-    const tkhd = full('tkhd', 0, 3, tkhdW.out());
+    const tkhd = tkhdBox(1, totalMs, Wd, Ht, false);
     const trak = box('trak', tkhd, mdia);
-    const mvW = new W().u32(0).u32(0).u32(1000).u32(totalMs).u32(0x10000).u16(0x100).zeros(10);
+    const at = audio && audio.samples.length ? audioTrak(audio, offset + vBytes, totalMs) : null;
+    const mvW = new W().u32(0).u32(0).u32(1000).u32(Math.max(totalMs, at?.ms ?? 0)).u32(0x10000).u16(0x100).zeros(10);
     for (const m of MATRIX) mvW.u32(m);
-    mvW.zeros(24).u32(2);
-    return box('moov', full('mvhd', 0, 0, mvW.out()), trak);
+    mvW.zeros(24).u32(at ? 3 : 2);
+    return box('moov', full('mvhd', 0, 0, mvW.out()), trak, ...(at ? [at.trak] : []));
   };
   const ftyp = box('ftyp', new W().str('isom').u32(0x200).str('isom').str('iso2').str(isAvc ? 'avc1' : 'vp09').str('mp41').out());
-  const mdatLen = 8 + samples.reduce((s, x) => s + x.data.length, 0);
+  const aSamples = audio?.samples ?? [];
+  const mdatLen = 8 + vBytes + aSamples.reduce((s, x) => s + x.data.length, 0);
   const probe = build(0);
   const moov = build(ftyp.length + probe.length + 8);
   const head = new W().u32(mdatLen).str('mdat').out();
-  return new Blob([ftyp, moov, head, ...samples.map((s) => s.data)] as BlobPart[], { type: 'video/mp4' });
+  return new Blob([ftyp, moov, head, ...samples.map((s) => s.data), ...aSamples.map((s) => s.data)] as BlobPart[], { type: 'video/mp4' });
 }
 
 // ------------------------------------------------------------------ WebM (EBML)
@@ -113,34 +161,60 @@ function el(id: number, ...parts: Uint8Array[]): Uint8Array {
   return out;
 }
 const uintEl = (id: number, v: number) => { const b: number[] = []; let x = v; do { b.unshift(x & 255); x = Math.floor(x / 256); } while (x > 0); return el(id, new Uint8Array(b)); };
+/** signed integer element, 8 bytes big-endian (DiscardPadding) */
+const sintEl = (id: number, v: number) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigInt64(0, BigInt(v)); return el(id, b); };
 const strEl = (id: number, s: string) => el(id, new TextEncoder().encode(s));
 const f64El = (id: number, v: number) => { const b = new Uint8Array(8); new DataView(b.buffer).setFloat64(0, v); return el(id, b); };
 
-export function muxWebM(track: TrackInfo, samples: Sample[]): Blob {
+export function muxWebM(track: TrackInfo, samples: Sample[], audio?: AudioTrack): Blob {
   const codecId = track.codec.startsWith('vp09') ? 'V_VP9' : track.codec.startsWith('vp8') ? 'V_VP8' : track.codec.startsWith('av01') ? 'V_AV1' : '';
   if (!codecId) throw new Error('WebM cannot hold ' + track.codec);
   // timestamps in ms (TimecodeScale 1 ms), accumulated without drift
   const starts: number[] = []; let t = 0;
   for (const s of samples) { starts.push(Math.round(t / 1000)); t += s.dur; }
-  const totalMs = Math.round(t / 1000);
+  let totalMs = Math.round(t / 1000);
+  let au = audio && audio.samples.length && audio.info.codec === 'opus' ? audio : null;
+  const aStarts: number[] = [];
+  let discardNs = 0;
+  if (au) {
+    // end the sound with the picture: drop packets that start after the end, discard the rest of the last one
+    const end = Math.round((t / 1e6) * au.info.rate) + au.info.preSkip, keep: AudioSample[] = [];
+    let at = 0;
+    for (const s of au.samples) { if (at >= end) break; aStarts.push(Math.round((at * 1000) / au.info.rate)); keep.push(s); at += s.dur; }
+    if (at > end) discardNs = Math.round(((at - end) * 1e9) / au.info.rate);
+    au = { info: au.info, samples: keep };
+  }
   const header = el(0x1a45dfa3, uintEl(0x4286, 1), uintEl(0x42f7, 1), uintEl(0x42f2, 4), uintEl(0x42f3, 8), strEl(0x4282, 'webm'), uintEl(0x4287, 4), uintEl(0x4285, 2));
   const info = el(0x1549a966, uintEl(0x2ad7b1, 1000000), strEl(0x4d80, 'Gesso'), strEl(0x5741, 'Gesso'), f64El(0x4489, totalMs));
   const tracks = el(0x1654ae6b, el(0xae, uintEl(0xd7, 1), uintEl(0x73c5, 1), uintEl(0x83, 1), strEl(0x86, codecId), uintEl(0x9c, 0),
-    el(0xe0, uintEl(0xb0, track.width), uintEl(0xba, track.height))));
-  // clusters start at keyframes (or when the 16-bit relative timecode would overflow)
+    el(0xe0, uintEl(0xb0, track.width), uintEl(0xba, track.height))),
+    ...(au ? [el(0xae, uintEl(0xd7, 2), uintEl(0x73c5, 2), uintEl(0x83, 2), strEl(0x86, 'A_OPUS'), uintEl(0x9c, 0), el(0x63a2, opusHead(au.info)),
+      uintEl(0x56aa, Math.round((au.info.preSkip * 1e9) / au.info.rate)), uintEl(0x56bb, 80000000),
+      el(0xe1, f64El(0xb5, au.info.rate), uintEl(0x9f, au.info.channels)))] : []));
+  // clusters start at video keyframes (or when the 16-bit relative timecode would overflow); audio blocks are
+  // interleaved by time into the same clusters
   const clusters: { time: number; parts: Uint8Array[] }[] = [];
-  samples.forEach((s, i) => {
+  const evs: { t: number; v: number; i: number }[] = samples.map((_, i) => ({ t: starts[i], v: 1, i }));
+  if (au) au.samples.forEach((_, i) => evs.push({ t: aStarts[i], v: 0, i }));
+  evs.sort((a, b) => a.t - b.t || b.v - a.v);
+  for (const ev of evs) {
     let c = clusters[clusters.length - 1];
-    if (!c || s.key || starts[i] - c.time > 30000) { c = { time: starts[i], parts: [uintEl(0xe7, starts[i])] }; clusters.push(c); }
-    const rel = starts[i] - c.time;
-    const hdr = new Uint8Array([0x81, (rel >> 8) & 255, rel & 255, s.key ? 0x80 : 0]);
-    const last = i === samples.length - 1;
-    if (last) {
+    const vs = ev.v ? samples[ev.i] : null;
+    if (!c || (vs && vs.key) || ev.t - c.time > 30000) { c = { time: ev.t, parts: [uintEl(0xe7, ev.t)] }; clusters.push(c); }
+    const rel = ev.t - c.time;
+    if (!vs) {
+      const ah = new Uint8Array([0x82, (rel >> 8) & 255, rel & 255, 0x80]);
+      if (ev.i === au!.samples.length - 1 && discardNs > 0) { ah[3] = 0; c.parts.push(el(0xa0, el(0xa1, ah, au!.samples[ev.i].data), sintEl(0x75a2, discardNs))); }
+      else c.parts.push(el(0xa3, ah, au!.samples[ev.i].data));
+      continue;
+    }
+    const hdr = new Uint8Array([0x81, (rel >> 8) & 255, rel & 255, vs.key ? 0x80 : 0]);
+    if (ev.i === samples.length - 1) {
       // last frame: a BlockGroup so its duration (e.g. the final hold) is explicit
       hdr[3] = 0;
-      c.parts.push(el(0xa0, el(0xa1, hdr, s.data), uintEl(0x9b, Math.max(1, totalMs - starts[i]))));
-    } else c.parts.push(el(0xa3, hdr, s.data));
-  });
+      c.parts.push(el(0xa0, el(0xa1, hdr, vs.data), uintEl(0x9b, Math.max(1, Math.round(t / 1000) - starts[ev.i]))));
+    } else c.parts.push(el(0xa3, hdr, vs.data));
+  }
   const clusterEls = clusters.map((c) => el(0x1f43b675, ...c.parts));
   // cues: positions relative to the segment payload start; Cues are written after the clusters
   const pre = info.length + tracks.length;
