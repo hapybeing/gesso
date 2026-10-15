@@ -12,6 +12,7 @@ async function start({ port = 8125, width = 1280, height = 800, dsf = 2, touch =
   const browser = await chromium.launch({ executablePath: require('./chrome.cjs'), args: ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--no-sandbox'] });
   const ctx = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: dsf, hasTouch: touch, acceptDownloads: true });
   const page = await ctx.newPage();
+  page.setDefaultNavigationTimeout(90000); page.setDefaultTimeout(90000); // shared, loaded CI box
   const errs = [];
   page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errs.push(m.type() + ': ' + m.text()); });
   page.on('pageerror', (e) => errs.push('pageerror: ' + e.message + ' @ ' + (e.stack || '').split('\n').slice(1, 4).join(' | ')));

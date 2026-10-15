@@ -80,7 +80,9 @@ export class StrokeBuilder {
   private curve: PressureCurve | null;
   private taperK: number;
   constructor(public brush: Brush, opts: StrokeOpts = {}) {
-    this.rand = rng((Math.random() * 1e9) | 0);
+    // tests set globalThis.__gessoSeed for reproducible jitter/scatter
+    const fixed = (globalThis as { __gessoSeed?: number }).__gessoSeed;
+    this.rand = rng(fixed != null ? fixed : (Math.random() * 1e9) | 0);
     this.curve = opts.curve || null;
     const vs = opts.viewScale || 1;
     const s = brush.smoothing;

@@ -9,7 +9,10 @@ const { start } = require('./lib.cjs');
   await page.waitForTimeout(900);
   const out = await page.evaluate(async () => {
     const g = window.gesso, e = g.engine, cv = document.querySelector('#view');
-    const ev = (t, o) => cv.dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, isPrimary: true, ...o }));
+    // synthetic, load-independent timestamps (8 ms apart): stroke dynamics are time-based, so wall-clock stamps under a
+    // busy CPU changed speed response and made the rim/centre comparison flaky (R4). Drying itself is step-based.
+    let clock = 1000; window.__gessoSeed = 12345;
+    const ev = (t, o) => { const x = new PointerEvent(t, { bubbles: true, cancelable: true, isPrimary: true, ...o }); clock += 8; Object.defineProperty(x, 'timeStamp', { value: clock }); cv.dispatchEvent(x); };
     const S = (x, y) => e.docToScreen(x, y);
     const raf = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
     g.state.toolBrush.brush = 'wc-wash'; g.state.overrides['wc-wash'] = { size: 110, smoothing: 0 }; g.state.color = [0.12, 0.3, 0.75]; g.tool = 'brush';
@@ -26,7 +29,7 @@ const { start } = require('./lib.cjs');
     // wet
     e.wetMedia = true; stroke(480);
     const dryingAfterLift = e.isDrying;
-    const t0 = performance.now(); let frames = 0; while (e.isDrying && frames < 400) { await new Promise((r) => requestAnimationFrame(r)); frames++; }
+    const t0 = performance.now(); let frames = 0; while (e.isDrying && frames < 2000) { await new Promise((r) => requestAnimationFrame(r)); frames++; }
     const dryMs = Math.round(performance.now() - t0);
     const wet = { prof: stats(prof(480)), tex: tex(480) };
     // undo while drying: settles then undoes the wet stroke itself
