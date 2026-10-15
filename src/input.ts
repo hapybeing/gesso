@@ -17,6 +17,13 @@ export interface InputHooks {
   captureAt(sx: number, sy: number, pointerType: string): boolean;
   /** a finger touched while the pen is drawing (used as a modifier, e.g. perfect shapes) */
   secondaryTouch(): void;
+  /**
+   * Customisable gestures (M5.6): a tap with 2/3/4 fingers, a touch & hold, a two-finger hold, the stylus side
+   * button. Returns false when the gesture is mapped to nothing (the default behaviour then applies, e.g. a side
+   * button press draws). `action` tells Input what the gesture is mapped to, for the ones it must handle itself.
+   */
+  gesture?(kind: 'tap2' | 'tap3' | 'tap4' | 'hold1' | 'hold2' | 'penButton', sx: number, sy: number, pointerId?: number): boolean;
+  action?(kind: 'hold1' | 'hold2'): string;
 }
 
 export type StylusMode = 'auto' | 'pen' | 'any';
@@ -47,7 +54,7 @@ export class Input {
   private gesture: {
     t0: number; maxTouches: number; moved: boolean;
     v0: { x: number; y: number; scale: number; rot: number };
-    ids: number[]; p0: [TouchPt, TouchPt] | null; held: boolean;
+    ids: number[]; p0: [TouchPt, TouchPt] | null; held: boolean; cx: number; cy: number;
   } | null = null;
   private repeatTimer: number | null = null;
   spaceDown = false;
@@ -114,7 +121,14 @@ export class Input {
         this.holdTimer = window.setTimeout(() => {
           this.holdTimer = null;
           const t = this.touches.get(id);
-          if (t && this.touches.size === 1 && Math.hypot(t.x - t.sx, t.y - t.sy) < 8) this.startEyedrop(id, t.x, t.y);
+          if (!t || this.touches.size !== 1 || Math.hypot(t.x - t.sx, t.y - t.sy) >= 8) return;
+          const act = this.hooks.action?.('hold1') ?? 'eyedrop';
+          if (act === 'eyedrop') { this.startEyedrop(id, t.x, t.y); return; }
+          if (act === 'none') return;
+          // another action: the touch is used up (a finger stroke that just started is cancelled)
+          if (this.drawId === id) { this.hooks.strokeCancel(); this.drawId = null; }
+          this.touches.delete(id); this.ignored.add(id);
+          this.hooks.gesture?.('hold1', t.x, t.y, id);
         }, 480);
       } else {
         this.clearHold();
@@ -129,6 +143,8 @@ export class Input {
       return;
     }
     if (e.pointerType === 'pen') this.penSeen = true;
+    // stylus side (barrel) button held while touching down: a customisable gesture
+    if (e.pointerType === 'pen' && (e.buttons & 2) && !(e.buttons & 32) && this.hooks.gesture?.('penButton', l.x, l.y, e.pointerId)) { this.ignored.add(e.pointerId); return; }
     if (e.pointerType === 'mouse') {
       if (e.button === 1 || (e.button === 0 && this.spaceDown)) { this.panMouse = { x: l.x, y: l.y }; return; }
       if (e.button === 2) { this.startEyedrop(e.pointerId, l.x, l.y); return; }
@@ -154,14 +170,21 @@ export class Input {
     const ids = [...this.touches.keys()].slice(0, 2);
     const p0 = ids.length === 2 ? [{ ...this.touches.get(ids[0])! }, { ...this.touches.get(ids[1])! }] as [TouchPt, TouchPt] : null;
     const prev = this.gesture;
+    let cx = 0, cy = 0; for (const t of this.touches.values()) { cx += t.sx / this.touches.size; cy += t.sy / this.touches.size; }
     this.gesture = {
       t0: prev ? prev.t0 : performance.now(),
       maxTouches: Math.max(prev ? prev.maxTouches : 0, this.touches.size),
       moved: prev ? prev.moved : false,
-      v0: { ...this.engine.view }, ids, p0, held: prev ? prev.held : false,
+      v0: { ...this.engine.view }, ids, p0, held: prev ? prev.held : false, cx, cy,
     };
+    const h2 = this.hooks.action?.('hold2') ?? 'repeatUndo';
+    if (this.touches.size === 2 && !prev && h2 !== 'repeatUndo' && h2 !== 'none') {
+      // two fingers held still: a one-shot action
+      this.stopRepeat();
+      this.repeatTimer = window.setTimeout(() => { this.repeatTimer = null; const g = this.gesture; if (!g || g.moved || this.touches.size !== 2) return; g.held = true; this.hooks.gesture?.('hold2', g.cx, g.cy); }, 650);
+    }
     // two fingers held still: rapid undo, accelerating, until they lift
-    if (this.touches.size === 2 && !prev) {
+    if (this.touches.size === 2 && !prev && h2 === 'repeatUndo') {
       this.stopRepeat();
       let delay = 260;
       const fire = () => {
@@ -266,7 +289,9 @@ export class Input {
           this.gesture = null;
           this.stopRepeat();
           if (!g.moved && !g.held && performance.now() - g.t0 < 380) {
-            if (g.maxTouches === 2) this.hooks.undo();
+            const kind = g.maxTouches === 2 ? 'tap2' : g.maxTouches === 3 ? 'tap3' : 'tap4';
+            if (this.hooks.gesture) this.hooks.gesture(kind, g.cx, g.cy);
+            else if (g.maxTouches === 2) this.hooks.undo();
             else if (g.maxTouches === 3) this.hooks.redo();
           }
         } else { this.stopRepeat(); this.beginGesture(); }

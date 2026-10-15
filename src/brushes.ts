@@ -265,9 +265,24 @@ export function addCustomBrushes(list: Brush[]): Brush[] {
   saveCustom();
   return added;
 }
-export function removeCustomBrush(id: string) { const i = BRUSHES.findIndex((b) => b.id === id && b.group === 'Imported'); if (i >= 0) { BRUSHES.splice(i, 1); saveCustom(); } }
-function saveCustom() { try { localStorage.setItem(CUSTOM_KEY, JSON.stringify(BRUSHES.filter((b) => b.group === 'Imported'))); } catch { /* storage full */ } }
+/** groups whose brushes the user owns (persisted, renamable, deletable) */
+export const CUSTOM_GROUPS = ['My brushes', 'Imported'];
+export const isCustom = (b: Brush) => CUSTOM_GROUPS.includes(b.group);
+export function removeCustomBrush(id: string) { const i = BRUSHES.findIndex((b) => b.id === id && isCustom(b)); if (i >= 0) { BRUSHES.splice(i, 1); saveCustom(); } }
+/** copy a brush (with the given settings) into "My brushes" */
+export function duplicateBrush(b: Brush, name: string): Brush {
+  const root = b.id.replace(/^(my|imp)-/, '').replace(/-\d+$/, '');
+  let id = 'my-' + root, n = 2;
+  while (BRUSHES.some((x) => x.id === id)) id = 'my-' + root + '-' + n++;
+  const c = { ...b, id, name: name.slice(0, 40), group: 'My brushes' };
+  BRUSHES.push(c); saveCustom();
+  return c;
+}
+export function renameCustomBrush(id: string, name: string) { const b = BRUSHES.find((x) => x.id === id && isCustom(x)); if (b) { b.name = name.slice(0, 40); saveCustom(); } }
+/** fold settings into a custom brush itself (its new baseline) */
+export function updateCustomBrush(id: string, patch: Partial<Brush>) { const b = BRUSHES.find((x) => x.id === id && isCustom(x)); if (b) { Object.assign(b, patch); saveCustom(); } }
+function saveCustom() { try { localStorage.setItem(CUSTOM_KEY, JSON.stringify(BRUSHES.filter(isCustom))); } catch { /* storage full */ } }
 try {
   const saved = JSON.parse(localStorage.getItem(CUSTOM_KEY) || '[]');
-  if (Array.isArray(saved)) for (const s of saved) { const b = validateBrush(s); if (b) { b.id = String(s.id).replace(/[^\w-]/g, '') || b.id; b.group = 'Imported'; if (!BRUSHES.some((x) => x.id === b.id)) BRUSHES.push(b); } }
+  if (Array.isArray(saved)) for (const s of saved) { const b = validateBrush(s); if (b) { b.id = String(s.id).replace(/[^\w-]/g, '') || b.id; b.group = CUSTOM_GROUPS.includes(s.group) ? s.group : 'Imported'; if (!BRUSHES.some((x) => x.id === b.id)) BRUSHES.push(b); } }
 } catch { /* ignore */ }

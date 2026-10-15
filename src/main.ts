@@ -1,5 +1,5 @@
 import { Engine, Tool, BLEND_MODES, Layer } from './engine';
-import { brushFile, parseBrushFile, addCustomBrushes, BRUSHES, Brush, SHAPES, GRAINS, makeShape, ShapeId } from './brushes';
+import { brushFile, parseBrushFile, addCustomBrushes, duplicateBrush, removeCustomBrush, renameCustomBrush, isCustom, BRUSHES, Brush, SHAPES, GRAINS, makeShape, ShapeId } from './brushes';
 import { StrokeBuilder, Sample, PressureCurve } from './stroke';
 import { Input, StylusMode } from './input';
 import { pressureSection } from './pressureui';
@@ -25,6 +25,8 @@ import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
 import { FillTool, FillSettings, FillRef, defaultFill } from './filltool';
 import { AnimAudio, AudioMeta } from './animaudio';
+import { QuickMenu, ActionId, GestureKind, DEFAULT_GESTURES, DEFAULT_SLOTS, quickSettings, ACTIONS } from './quickmenu';
+import { SavedSel, putSel, getSel, delSel, maskThumb } from './savedsel';
 import { PaletteLibrary, Palette, cleanPalette } from './palette';
 import { PaletteHost, paletteSection, DOC as DOC_PAL } from './paletteui';
 import { Guides, GuideKind, GUIDE_LABEL, defaultGuides, GuideAssist, GuideHandle, guideHandleAt, dragGuideHandle, drawGuides, rulerAngle } from './guides';
@@ -78,18 +80,20 @@ const ICON = {
 };
 
 // ------------------------------------------------------------------ persisted state
-interface Settings { stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; selKind?: string; predict: boolean; wetMedia: boolean; harmony?: string; }
+interface Settings { gestures?: Partial<Record<GestureKind, ActionId>>; quickSlots?: ActionId[]; /** handedness: 'left' mirrors the interface (sidebar right, tools and panels left) */ handed?: 'right' | 'left'; stylus: StylusMode; curve: [number, number, number, number]; leftRail: boolean; snapShapes: boolean; snapDelay: number; selKind?: string; predict: boolean; wetMedia: boolean; harmony?: string; }
 interface State {
   toolBrush: Record<Tool, string>;
   color: RGB; recent: string[];
   settings: Settings;
   overrides: Record<string, Partial<Brush>>;
+  /** brush ids starred by the user, and the most recently painted with (newest first) */
+  favBrushes: string[]; recentBrushes: string[];
 }
 const DEFAULT_STATE: State = {
   toolBrush: { brush: 'ink-studio', eraser: 'air-hard', smudge: 'smudge-soft' },
   color: [0.12, 0.11, 0.1], recent: [],
   settings: { stylus: 'auto', curve: [0.25, 0.25, 0.75, 0.75], leftRail: true, snapShapes: true, snapDelay: 500, predict: true, wetMedia: true },
-  overrides: {},
+  overrides: {}, favBrushes: [], recentBrushes: [],
 };
 /** colour harmony modes: hue offsets (turns) of the partners */
 const HARMONY: Record<string, number[]> = { off: [], comp: [0.5], analog: [-1 / 12 + 1, 1 / 12], triad: [1 / 3, 2 / 3], split: [5 / 12, 7 / 12], tetrad: [0.25, 0.5, 0.75], shades: [] };
@@ -145,6 +149,9 @@ class App {
   /** palette library (localStorage) and the palette carried by the open artwork */
   palettes = new PaletteLibrary();
   docPalette: Palette | null = null;
+  /** selections saved with the open artwork */
+  savedSels: SavedSel[] = [];
+  selSavedOpen = false;
   /** the animation's audio track */
   audio = new AnimAudio();
   palHost!: PaletteHost;
@@ -178,6 +185,8 @@ class App {
       eyedropArmed: () => this.eyedropOnce,
       captureAt: (sx, sy) => this.captureAt(sx, sy),
       secondaryTouch: () => this.shapes.secondary(),
+      gesture: (k, sx, sy, pid) => this.onGesture(k, sx, sy, pid),
+      action: (k) => this.gestureMap()[k],
     });
     this.ov = h('canvas', { id: 'ov' }) as HTMLCanvasElement;
     this.canvas.after(this.ov);
@@ -296,12 +305,20 @@ class App {
   /** frames of time-lapse that came inside an imported file (the recorder continues them) */
   tlImported = 0;
   /** extra zip entries for .gesso (audio) */
-  extraFiles(): { name: string; data: Uint8Array }[] { return this.audio.ready && this.audio.bytes ? [{ name: 'gesso/audio', data: this.audio.bytes }] : []; }
+  async extraFiles(): Promise<{ name: string; data: Uint8Array }[]> {
+    const out: { name: string; data: Uint8Array }[] = this.audio.ready && this.audio.bytes ? [{ name: 'gesso/audio', data: this.audio.bytes }] : [];
+    const id = this.autosave.docId;
+    if (id) for (const q of this.savedSels) { const b = await store.getAsset(id, 'sel-' + q.id); if (b) out.push({ name: 'gesso/selections/' + q.id, data: new Uint8Array(await b.arrayBuffer()) }); }
+    return out;
+  }
+  private pendingSels: { id: string; data: Uint8Array }[] = [];
   /** audio bytes inside an imported file (set on the document once it has an id) */
   private pendingAudio: { bytes: Uint8Array; meta: AudioMeta } | null = null;
   async readExtraFiles(zip: Map<string, () => Promise<Uint8Array>>, extra: Record<string, unknown>) {
     const f = zip.get('gesso/audio'), m = extra.audio as AudioMeta | undefined;
     this.pendingAudio = f && m ? { bytes: await f(), meta: m } : null;
+    this.pendingSels = [];
+    for (const q of (Array.isArray(extra.selections) ? extra.selections : []) as SavedSel[]) { const z = zip.get('gesso/selections/' + q.id); if (z) this.pendingSels.push({ id: q.id, data: await z() }); }
   }
   /** pick an audio file for the animation */
   importAudio() {
@@ -317,7 +334,7 @@ class App {
     inp.click();
   }
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st }, palette: this.docPalette, audio: this.audio.meta }; }
+  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st }, palette: this.docPalette, audio: this.audio.meta, selections: this.savedSels }; }
   applyDocExtra(x: Record<string, unknown>) {
     this.anim.load(x.anim as Partial<AnimState> | undefined);
     $('#bAnim')?.classList.toggle('on', this.anim.on);
@@ -327,6 +344,7 @@ class App {
     this.refUid = typeof x.fillRef === 'string' ? x.fillRef : null;
     // an artwork that carries a palette opens with it; one without falls back to the library's
     this.docPalette = x.palette ? cleanPalette(x.palette) : null;
+    this.savedSels = Array.isArray(x.selections) ? (x.selections as SavedSel[]).filter((q) => q && typeof q.id === 'string' && q.w === this.engine.w && q.h === this.engine.h).map((q) => ({ id: q.id.replace(/[^\w-]/g, ''), name: String(q.name || 'Selection').slice(0, 40), w: q.w, h: q.h, thumb: typeof q.thumb === 'string' && q.thumb.startsWith('data:image/png') ? q.thumb : '', bytes: +q.bytes || 0 })) : [];
     if (this.docPalette) this.palettes.activeId = DOC_PAL; else if (this.palettes.activeId === DOC_PAL) this.palettes.activeId = this.palettes.list[0].id;
     const gd = x.guides as Partial<Guides> | undefined;
     this.guides = { ...defaultGuides(this.engine.w, this.engine.h), ...(gd || {}) };
@@ -395,6 +413,8 @@ class App {
       if (doc.zip) await this.readExtraFiles(doc.zip, doc.extra || {});
       const meta: DocMeta = { id, name: doc.name, w: doc.w, h: doc.h, bg: doc.bg, bgVisible: doc.bgVisible, layers: [], active: doc.active, created: now, modified: now };
       this.autosave.attach(meta, false);
+      for (const q of this.pendingSels) await store.putAsset(id, 'sel-' + q.id, new Blob([q.data as BlobPart]));
+      this.pendingSels = [];
       const pa = this.pendingAudio as { bytes: Uint8Array; meta: AudioMeta } | null; this.pendingAudio = null;
       if (pa) { await this.audio.set(pa.bytes, pa.meta.name, pa.meta.type, pa.meta).catch(() => this.toast('The audio in this file cannot be played here')); }
       localStorage.setItem('gesso.last', meta.id);
@@ -420,7 +440,7 @@ class App {
     // the time-lapse recording (and the animation's audio) travel inside the file
     const files: { name: string; data: Uint8Array }[] = [];
     if (this.autosave.docId) { await this.tl.flush(); files.push(...await packTimelapse(this.autosave.docId)); }
-    files.push(...this.extraFiles());
+    files.push(...await this.extraFiles());
     return writeGesso({ files,  name: this.autosave.meta?.name || 'Untitled', w: e.w, h: e.h, bg: e.bg, bgVisible: e.bgVisible, active: e.active, layers, merged, thumb, extra: this.docExtra() }, (px, w, h) => pngEncode(px, w, h, false));
   }
 
@@ -590,6 +610,7 @@ class App {
     if (this.shapes.phase === 'hold') { this.shapes.holdEnd(); this.builder = null; return; }
     this.shapes.strokeEnded();
     if (!this.builder) return;
+    this.noteRecentBrush(this.state.toolBrush[this.strokeTool]);
     if (this.assist) {
       // lifted before the direction was read: a dot or a tiny mark, drawn as it was
       const rest = this.assist.flush();
@@ -826,7 +847,9 @@ class App {
       const out = h('b', { class: 'edge-val' }, fmt(get()));
       const r = h('input', { type: 'range', min: String(min), max: String(max), step: '1', value: String(get()), class: 'edge-range', 'aria-label': label }) as HTMLInputElement;
       r.oninput = () => { set(+r.value); out.textContent = fmt(+r.value); upd(); };
-      return h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, label), r, out);
+      // exact pixel steps (a slider can't land on 1 px on a 4000 px canvas)
+      const step = (d: number) => h('button', { class: 'ib small', 'aria-label': (d < 0 ? 'Minus' : 'Plus') + ' one pixel', onClick: () => { const v = Math.max(min, Math.min(max, get() + d)); set(v); r.value = String(v); out.textContent = fmt(v); upd(); } }, d < 0 ? '−' : '+');
+      return h('label', { class: 'edge-row' }, h('span', { class: 'muted' }, label), step(-1), r, step(1), out);
     };
     bar.append(
       slider('Shrink / Grow', -maxGrow, maxGrow, () => a.grow, (v) => { a.grow = v; }, (v) => (v > 0 ? '+' : '') + v + ' px'),
@@ -853,9 +876,17 @@ class App {
       chip('Clear', false, () => e.clearLayer(), !has),
       chip('Transform', false, () => void this.startLayerTransform(), !has),
       chip('Deselect', false, () => e.deselect(), !has),
+      chip(`Saved${this.savedSels.length ? ' · ' + this.savedSels.length : ''}`, this.selSavedOpen, () => { this.selSavedOpen = !this.selSavedOpen; }),
       h('button', { class: 'btn small', onClick: () => this.exitSelectTool() }, 'Done')));
+    if (this.selSavedOpen) {
+      const row = h('div', { class: 'chips selsaved' }, h('button', { class: 'chip', disabled: !has, onClick: () => void this.saveSelection() }, '+ Save selection'));
+      for (const q of this.savedSels) row.append(h('span', { class: 'selitem' },
+        h('button', { class: 'chip', title: 'Load ' + q.name, onClick: () => void this.loadSaved(q) }, q.thumb ? h('img', { src: q.thumb, alt: '' }) : '', q.name),
+        h('button', { class: 'ib small', title: 'Delete ' + q.name, 'aria-label': 'Delete ' + q.name, onClick: () => void this.deleteSaved(q) }, '×')));
+      if (!this.savedSels.length) row.append(h('span', { class: 'muted small' }, 'Saved selections stay with this artwork.'));
+      bar.append(row);
+    }
   }
-  /** lift the selection (or the whole layer) into the transform box */
   /**
    * Transform tween (M5.5): a copy of the current frame opens in the transform box (the frame shows as onion skin
    * underneath); on Done the copy becomes the end key and `n` in-betweens are rendered between them from the same
@@ -906,6 +937,27 @@ class App {
     }, init);
   }
 
+  async saveSelection() {
+    const e = this.engine, id = this.autosave.docId; if (!id) return;
+    const m = await e.readSelection(); if (!m) { this.toast('Nothing selected'); return; }
+    const sid = 's' + Date.now().toString(36);
+    const bytes = await putSel(id, sid, m);
+    this.savedSels.push({ id: sid, name: 'Selection ' + (this.savedSels.length + 1), w: e.w, h: e.h, thumb: maskThumb(m, e.w, e.h), bytes });
+    this.autosave.touch(); this.renderSelBar();
+    this.toast(`Saved · ${Math.max(1, Math.round(bytes / 1024))} KB`);
+  }
+  async loadSaved(q: SavedSel) {
+    const id = this.autosave.docId; if (!id) return;
+    const m = await getSel(id, q.id); if (!m) { this.toast('That selection is missing'); return; }
+    try { this.engine.loadSelection(m, 'Load ' + q.name); } catch (err) { this.toast((err as Error).message); }
+    this.renderSelBar();
+  }
+  async deleteSaved(q: SavedSel) {
+    const id = this.autosave.docId; if (!id) return;
+    this.savedSels = this.savedSels.filter((x) => x !== q); await delSel(id, q.id);
+    this.autosave.touch(); this.renderSelBar();
+  }
+  /** lift the selection (or the whole layer) into the transform box */
   async startLayerTransform() {
     this.exitFillTool();
     this.settle(); this.closePop();
@@ -1039,7 +1091,10 @@ class App {
       tb('bFill', ICON.fill, 'Fill, gradient, recolour', () => this.toggleFillTool()),
       tb('bText', ICON.text, 'Text', () => { this.settle(); this.closePop(); if (this.text.active) this.text.disarm(); else { if (this.selTool) this.exitSelectTool(); this.text.arm(); } }),
       tb('bAdjust', ICON.adjust, 'Adjustments', () => this.togglePop('adjust', (el) => this.adj.renderMenu(el, () => this.closePop()))),
+      tb('bQuick', `<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5"/><path d="M12 4v3M12 17v3M4 12h3M17 12h3"/>`, 'Quick menu', () => { const b = $('#bQuick').getBoundingClientRect(); this.quick.show(b.left + b.width / 2, b.bottom + 130); }),
     );
+    // full screen: a floating button brings the interface back
+    document.body.append(h('button', { id: 'bUnhide', class: 'ib', title: 'Show the interface', 'aria-label': 'Show the interface', onClick: () => document.body.classList.remove('noui') }, svg('<path d="M8 3H3v5M16 3h5v5M21 16v5h-5M3 16v5h5"/>')));
     const right = h('div', { class: 'grp' },
       tb('tBrush', ICON.brush, 'Paint', () => this.pickTool('brush')),
       tb('tSmudge', ICON.smudge, 'Smudge', () => this.pickTool('smudge')),
@@ -1055,6 +1110,7 @@ class App {
     // side rail
     const rail = $('#rail');
     rail.classList.toggle('right', !this.state.settings.leftRail);
+    document.body.classList.toggle('lefty', this.state.settings.handed === 'left');
     const sizeS = this.vslider('size', (t) => {
       const b = this.brushFor(this.tool);
       this.setBrushProp('size', Math.round((1 + 499 * t * t) * 10) / 10);
@@ -1136,40 +1192,66 @@ class App {
   closePop() { this.pop?.remove(); this.pop = null; this.popKind = ''; }
 
   // ---------------------------------------------------------------- brush library
+  /** remember a brush as recently used (newest first, 12 kept) */
+  noteRecentBrush(id: string) {
+    const r = this.state.recentBrushes;
+    if (r[0] === id) return;
+    this.state.recentBrushes = [id, ...r.filter((x) => x !== id)].slice(0, 12); this.save();
+  }
   renderBrushes(el: HTMLElement) {
     el.innerHTML = '';
-    const tool = this.tool;
-    const groups = [...new Set(BRUSHES.map((b) => b.group))];
+    const tool = this.tool, st = this.state;
+    const FAV = '★ Favourites', REC = 'Recent';
+    const real = [...new Set(BRUSHES.map((b) => b.group))];
+    const groups = [...(st.favBrushes.length ? [FAV] : []), ...(st.recentBrushes.length ? [REC] : []), ...real];
     const cur = this.brushFor(tool);
-    let group = cur.group;
-    if (!groups.includes(group)) group = groups[0];
+    if (!this.brushGroup || !groups.includes(this.brushGroup)) this.brushGroup = groups.includes(cur.group) ? cur.group : groups[0];
     const head = h('div', { class: 'pop-head' }, h('b', {}, tool === 'brush' ? 'Brushes' : tool === 'smudge' ? 'Smudge with' : 'Erase with'),
       h('button', { class: 'chip small', title: 'Import .gessobrush', onClick: () => this.importBrushes() }, 'Import'),
       h('button', { class: 'chip small', title: 'Export this brush with your settings', onClick: () => this.exportBrush() }, 'Export'),
       h('button', { class: 'chip', onClick: () => this.openStudio() }, svg(ICON.sliders), 'Brush studio'));
     const side = h('div', { class: 'groups' });
     const list = h('div', { class: 'blist' });
+    const byId = (id: string) => BRUSHES.find((b) => b.id === id);
     const drawList = () => {
       side.innerHTML = '';
-      for (const g of groups) side.append(h('button', { class: 'gbtn' + (g === group ? ' on' : ''), onClick: () => { group = g; drawList(); } }, g));
+      for (const g of groups) side.append(h('button', { class: 'gbtn' + (g === this.brushGroup ? ' on' : ''), onClick: () => { this.brushGroup = g; drawList(); } }, g));
       list.innerHTML = '';
-      for (const b0 of BRUSHES.filter((b) => b.group === group)) {
-        const b = { ...b0, ...(this.state.overrides[b0.id] || {}) };
+      const g = this.brushGroup!;
+      const items = g === FAV ? st.favBrushes.map(byId) : g === REC ? st.recentBrushes.map(byId) : BRUSHES.filter((b) => b.group === g);
+      for (const b0 of items) {
+        if (!b0) continue;
+        const b = { ...b0, ...(st.overrides[b0.id] || {}) };
         const cv = h('canvas', { width: 360, height: 70 }) as HTMLCanvasElement;
         drawBrushPreview(cv, b);
-        const on = b.id === this.state.toolBrush[tool];
-        list.append(h('button', {
-          class: 'brow' + (on ? ' on' : ''),
-          onClick: () => {
-            if (on) { this.openStudio(); return; }
-            this.state.toolBrush[tool] = b.id; this.save(); this.syncSliders(); drawList();
-          },
-        }, h('span', { class: 'bname' }, b.name), cv));
+        const on = b.id === st.toolBrush[tool], fav = st.favBrushes.includes(b.id);
+        const row = h('div', { class: 'brow' + (on ? ' on' : '') });
+        const pick = h('button', { class: 'bpick', onClick: () => {
+          if (on) { this.openStudio(); return; }
+          st.toolBrush[tool] = b.id; this.save(); this.syncSliders(); drawList();
+        } }, h('span', { class: 'bname' }, (fav ? '★ ' : '') + b.name + (st.overrides[b.id] && Object.keys(st.overrides[b.id]).length ? ' •' : '')), cv);
+        const more = h('button', { class: 'bmore', title: 'Brush options', 'aria-label': 'Brush options ' + b.name, onClick: () => {
+          const open = row.querySelector('.bmenu'); list.querySelectorAll('.bmenu').forEach((m) => m.remove()); if (open) return;
+          const act = (label: string, fn: () => void, dis = false, cls = 'chip small') => h('button', { class: cls, disabled: dis, onClick: () => { fn(); drawList(); } }, label);
+          const edited = !!st.overrides[b.id] && Object.keys(st.overrides[b.id]).length > 0;
+          row.append(h('div', { class: 'bmenu chips' },
+            act(fav ? '★ Unfavourite' : '☆ Favourite', () => { st.favBrushes = fav ? st.favBrushes.filter((x) => x !== b.id) : [...st.favBrushes, b.id]; this.save(); if (!fav && !groups.includes(FAV)) this.renderBrushes(el); }),
+            act('Duplicate', () => { const c = duplicateBrush(b, b.name + ' copy'); st.toolBrush[tool] = c.id; this.save(); this.syncSliders(); this.brushGroup = 'My brushes'; this.renderBrushes(el); this.toast('Duplicated into My brushes'); }),
+            act('Reset', () => { delete st.overrides[b.id]; this.save(); this.syncSliders(); this.toast(b.name + ' reset to its default settings'); }, !edited),
+            isCustom(b0) ? act('Rename', () => { const n = prompt('Brush name', b0.name); if (n && n.trim()) renameCustomBrush(b0.id, n.trim()); }) : null,
+            isCustom(b0) ? act('Delete', () => { if (!confirm(`Delete “${b0.name}”?`)) return; removeCustomBrush(b0.id); st.favBrushes = st.favBrushes.filter((x) => x !== b0.id); st.recentBrushes = st.recentBrushes.filter((x) => x !== b0.id); delete st.overrides[b0.id];
+              for (const t of ['brush', 'eraser', 'smudge'] as Tool[]) if (st.toolBrush[t] === b0.id) st.toolBrush[t] = DEFAULT_STATE.toolBrush[t];
+              this.save(); this.syncSliders(); this.renderBrushes(el); }, false, 'chip small danger') : null));
+        } }, '⋯');
+        row.append(h('div', { class: 'brow-top' }, pick, more));
+        list.append(row);
       }
+      if (!list.childElementCount) list.append(h('p', { class: 'muted small' }, g === FAV ? 'Star brushes with ⋯ → Favourite.' : 'Brushes you paint with show up here.'));
     };
     drawList();
     el.append(head, h('div', { class: 'bwrap' }, side, list));
   }
+  brushGroup: string | null = null;
 
   openStudio() {
     this.closePop();
@@ -1511,6 +1593,7 @@ class App {
       this.installEvt ? item('Install Gesso app', () => this.installEvt.prompt()) : null,
       item('Settings', () => this.showSettings()),
       item('Gestures & help', () => this.showHelp()),
+      item('Gestures & quick menu…', () => this.showGestureSettings()),
     ].filter(Boolean) as HTMLElement[]);
   }
 
@@ -1583,9 +1666,12 @@ class App {
     };
     drawSeg();
     const pres = pressureSection(this.curve, st.curve, (c) => { st.curve = c; this.save(); });
+    const hand = h('div', { class: 'chips' });
+    const drawHand = () => { hand.innerHTML = ''; for (const [v, l] of [['right', 'Right-handed'], ['left', 'Left-handed']] as const) hand.append(h('button', { class: 'chip' + ((st.handed || 'right') === v ? ' on' : ''), onClick: () => { this.setHanded(v); drawHand(); drawRail(); } }, l)); };
     const rail = h('input', { type: 'checkbox' }) as HTMLInputElement;
-    rail.checked = !st.leftRail;
+    const drawRail = () => { rail.checked = !st.leftRail; };
     rail.onchange = () => { st.leftRail = !rail.checked; $('#rail').classList.toggle('right', rail.checked); this.save(); };
+    drawHand(); drawRail();
     s.body.append(
       h('section', {}, h('h4', {}, 'Touch & stylus'), seg, h('p', { class: 'muted' }, 'Palm rejection: in Auto, once Gesso sees your stylus, fingers only pan, zoom, rotate, undo and pick colours. Large contact patches (a resting palm) are always ignored.')),
       pres,
@@ -1608,12 +1694,70 @@ class App {
         return h('section', {}, h('h4', {}, 'Brush feel'),
           h('label', { class: 'srow' }, h('span', {}, 'Predicted tip — draw slightly ahead of the pen to hide display latency'), pr),
           h('label', { class: 'srow' }, h('span', {}, 'Watercolour dries on the paper (pigment flows to the edges and settles in the grain)'), wm),
-          h('div', { class: 'chips' }, h('button', { class: 'chip', onClick: () => { s.close(); this.openStylusTest(); } }, 'Stylus & palm test…')));
+          h('div', { class: 'chips' }, h('button', { class: 'chip', onClick: () => { s.close(); this.openStylusTest(); } }, 'Stylus & palm test…'), h('button', { class: 'chip', onClick: () => { s.close(); this.showGestureSettings(); } }, 'Gestures & quick menu…')));
       })(),
-      h('section', {}, h('h4', {}, 'Layout'), h('label', { class: 'srow' }, h('span', {}, 'Sidebar on the right'), rail)),
+      h('section', {}, h('h4', {}, 'Layout'), hand,
+        h('p', { class: 'muted' }, 'Left-handed mirrors the interface: brushes, colour and panels move to the left, the size/opacity sidebar to the right, so your drawing hand never covers what the other hand reaches for.'),
+        h('label', { class: 'srow' }, h('span', {}, 'Sidebar on the right'), rail)),
     );
   }
 
+  // ---------------------------------------------------------------- quick menu + gestures (M5.6)
+  quick = new QuickMenu({ run: (a) => this.runAction(a), slots: () => this.quickSlots() });
+  quickSlots(): ActionId[] { const q = this.state.settings.quickSlots; return q && q.length === 8 ? q : [...DEFAULT_SLOTS]; }
+  gestureMap(): Record<GestureKind, ActionId> { return { ...DEFAULT_GESTURES, ...(this.state.settings.gestures || {}) }; }
+  /** a mapped gesture happened at screen (sx, sy) in canvas coordinates */
+  onGesture(k: GestureKind, sx: number, sy: number, pid?: number): boolean {
+    const a = this.gestureMap()[k];
+    if (a === 'none') return false;
+    const r = this.canvas.getBoundingClientRect();
+    if (a === 'quickmenu') { this.quick.show(r.left + sx, r.top + sy, k === 'hold1' || k === 'penButton' ? pid : undefined); return true; }
+    if (a === 'eyedrop' && (k === 'penButton' || k === 'hold2')) { this.eyedropOnce = true; $('#bDrop')?.classList.add('on'); this.toast('Touch to pick a colour'); return true; }
+    this.runAction(a === 'repeatUndo' ? 'undo' : a);
+    return true;
+  }
+  /** run one action from the catalogue (quick menu slots, gestures) */
+  runAction(a: ActionId) {
+    const e = this.engine;
+    switch (a) {
+      case 'undo': this.undo(); break;
+      case 'redo': this.redo(); break;
+      case 'quickmenu': { const r = this.canvas.getBoundingClientRect(); this.quick.show(r.left + r.width / 2, r.top + r.height / 2); break; }
+      case 'eyedrop': this.eyedropOnce = true; $('#bDrop')?.classList.add('on'); this.toast('Touch to pick a colour'); break;
+      case 'brush': case 'eraser': case 'smudge': this.pickTool(a, true); this.toast(ACTIONS[a].label + ' · ' + this.brushFor(a).name); break;
+      case 'swapTool': { const t = this.tool === 'eraser' ? 'brush' : 'eraser'; this.pickTool(t, true); this.toast(ACTIONS[t].label + ' · ' + this.brushFor(t).name); break; }
+      case 'fill': this.toggleFillTool(); break;
+      case 'select': this.toggleSelectTool(); break;
+      case 'transform': void this.startLayerTransform(); break;
+      case 'text': $('#bText')?.click(); break;
+      case 'newLayer': if (!e.addLayer()) this.toast('Layer limit reached for this canvas size'); break;
+      case 'duplicateLayer': if (!e.duplicateLayer()) this.toast('Layer limit reached for this canvas size'); break;
+      case 'clearLayer': this.settle(); e.clearLayer(); break;
+      case 'layers': this.togglePop('layers', this.renderLayers, true); break;
+      case 'colour': this.togglePop('color', this.renderColor, true); break;
+      case 'brushes': this.togglePop('brushes-' + this.tool, this.renderBrushes, true); break;
+      case 'fit': this.fit(); break;
+      case 'hideUI': document.body.classList.toggle('noui'); this.closePop(); if (document.body.classList.contains('noui')) this.toast('Full screen · same gesture or button to come back'); break;
+      case 'play': if (!this.anim.on) this.anim.toggle(true); this.anim.togglePlay(); break;
+      case 'anim': $('#bAnim')?.click(); break;
+      case 'guides': this.toggleGuideBar(); break;
+      case 'symmetry': this.toggleSymBar(); break;
+      case 'deselect': e.deselect(); break;
+      case 'exportPNG': void this.exportPNG(); break;
+    }
+  }
+  showGestureSettings() {
+    const s = this.sheet('Gestures & quick menu');
+    const st = this.state.settings;
+    st.gestures = this.gestureMap(); st.quickSlots = this.quickSlots();
+    quickSettings(s.body, st.quickSlots, st.gestures as Record<GestureKind, ActionId>, () => this.save());
+    s.body.append(h('div', { class: 'chips' }, h('button', { class: 'chip', onClick: () => { st.gestures = { ...DEFAULT_GESTURES }; st.quickSlots = [...DEFAULT_SLOTS]; this.save(); s.close(); this.showGestureSettings(); } }, 'Restore defaults')));
+  }
+  /** handedness: mirror the interface (and put the sidebar on the off hand's side) */
+  setHanded(v: 'right' | 'left') {
+    const st = this.state.settings; st.handed = v; st.leftRail = v === 'right';
+    document.body.classList.toggle('lefty', v === 'left'); $('#rail')?.classList.toggle('right', !st.leftRail); this.save(); this.closePop(); this.fit();
+  }
   openStylusTest() { this.closePop(); return openStylusTest(); }
 
   showHelp() {

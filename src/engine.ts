@@ -1141,6 +1141,24 @@ export class Engine {
 
   // ---------------------------------------------------------------- selection
   /** replace the selection mask (null = none), undoably */
+  /** the selection mask as one byte per pixel (GL row order; loadSelection takes the same), null when none */
+  async readSelection(): Promise<Uint8Array | null> {
+    if (!this.sel) return null;
+    const px = await new Readback(this.gl, this.sel.fb, 0, 0, this.w, this.h).wait();
+    const out = new Uint8Array(this.w * this.h);
+    for (let i = 0, k = 0; k < out.length; i += 4, k++) out[k] = px[i];
+    return out;
+  }
+  /** replace the selection with a stored mask (one undo step) */
+  loadSelection(m: Uint8Array, label = 'Load selection') {
+    if (m.length !== this.w * this.h) throw new Error('Selection is for a different canvas size');
+    const gl = this.gl, t = this.newTarget(), px = new Uint8Array(m.length * 4);
+    for (let i = 0, k = 0; k < m.length; i += 4, k++) { const v = m[k]; px[i] = v; px[i + 1] = v; px[i + 2] = v; px[i + 3] = v; }
+    gl.bindTexture(gl.TEXTURE_2D, t.tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, this.w, this.h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.setSelection(t, label);
+  }
   setSelection(next: Target | null, label: string) {
     let held: Stash | null = this.sel ? new Stash(this.gl, this.sel, this.stashes) : null;
     this.sel = next;
