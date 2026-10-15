@@ -13,7 +13,7 @@ import { Gallery, ask } from './gallery';
 import { $, h } from './dom';
 import { dragSort, DRAG_STATS } from './dragsort';
 import { packTimelapse, unpackTimelapse, TimelapseRecorder, TimelapseView, loadClip, exportClip, selectFrames } from './timelapse';
-import { Animator, AnimState } from './animation';
+import { Ease, EASE, Animator, AnimState } from './animation';
 import { exportSheet, exportAnimation } from './animexport';
 import { GifSession, buildPalette } from './gif';
 import { readGesso, writeGesso } from './gessofile';
@@ -227,7 +227,7 @@ class App {
     this.autosave.blocked = () => !!this.xform || this.shapes.active || this.adj.active || !!this.text.layer;
     this.audio.onChange = () => { this.anim?.renderBar(); };
     this.anim = new Animator({
-      engine: this.engine, audio: this.audio, importAudio: () => this.importAudio(),
+      engine: this.engine, audio: this.audio, importAudio: () => this.importAudio(), tween: (n, ease) => void this.tweenFrame(n, ease),
       toast: (m) => this.toast(m),
       changed: () => { this.autosave.touch(); $('#bAnim')?.classList.toggle('on', this.anim.on); },
       openExport: () => this.showAnimExport(),
@@ -856,6 +856,56 @@ class App {
       h('button', { class: 'btn small', onClick: () => this.exitSelectTool() }, 'Done')));
   }
   /** lift the selection (or the whole layer) into the transform box */
+  /**
+   * Transform tween (M5.5): a copy of the current frame opens in the transform box (the frame shows as onion skin
+   * underneath); on Done the copy becomes the end key and `n` in-betweens are rendered between them from the same
+   * source pixels (never resampled twice). Affine poses interpolate centre, rotation angle and (geometrically) scale separately (a
+   * matrix lerp would shrink mid-rotation and collapse at 180°); distort/warp interpolate their corners/control
+   * points. One undo step.
+   */
+  async tweenFrame(n: number, ease: Ease) {
+    const e = this.engine, a = this.anim, fr = a.frames(), i = a.current(fr);
+    if (i < 0) return;
+    const f = fr[i], A = f.base;
+    if (A.group) { this.toast('Tween works on a single layer frame'); return; }
+    if (e.layers.length + n + 1 > e.maxLayersFor(e.w, e.h)) { this.toast('Not enough room for ' + (n + 1) + ' more frames on this canvas'); return; }
+    this.exitFillTool(); this.settle(); this.closePop(); a.stop();
+    const bb = await e.contentBounds(A.target);
+    if (!bb) { this.toast('This frame is empty'); return; }
+    const src = e.sourceFromTarget(A.target, bb);
+    e.active = e.layers.indexOf(f.clips.length ? f.clips[f.clips.length - 1] : A);
+    const B = e.addLayerRaw(A.name + ' end');
+    if (!B) { e.freeSource(src); this.toast('Frame limit reached for this canvas size'); return; }
+    a.apply();
+    const init = { cx: bb.x + bb.w / 2, cy: bb.y + bb.h / 2, sx: 1, sy: 1, rot: 0 };
+    this.toast('Move, scale or rotate the end pose, then Done');
+    this.startTransform(B, src, 'insert', (commit, tool) => {
+      if (!commit) { e.removeLayerRaw(B); a.apply(); return; }
+      e.history.beginGroup();
+      e.recordInsert(B, 'Tween');
+      const end = { xf: { ...tool.xf }, quad: tool.quad.map((p) => ({ ...p })), grid: tool.grid.map((p) => ({ ...p })) };
+      const c0 = tool.corners(init), lerp = (p: number, q: number, t: number) => p + (q - p) * t;
+      const bil = (u: number, v: number) => ({ x: lerp(lerp(c0[0].x, c0[1].x, u), lerp(c0[3].x, c0[2].x, u), v), y: lerp(lerp(c0[0].y, c0[1].y, u), lerp(c0[3].y, c0[2].y, u), v) });
+      const grid0 = Array.from({ length: 16 }, (_, k) => bil((k % 4) / 3, Math.floor(k / 4) / 3));
+      const E = EASE[ease];
+      // scale changes geometrically (equal zoom ratio per frame) unless it flips sign
+      const sc = (p: number, q: number, t: number) => p * q > 0 ? Math.sign(p) * Math.exp(lerp(Math.log(Math.abs(p)), Math.log(Math.abs(q)), t)) : lerp(p, q, t);
+      for (let k = 1; k <= n; k++) {
+        const t = E(k / (n + 1));
+        tool.xf = { cx: lerp(init.cx, end.xf.cx, t), cy: lerp(init.cy, end.xf.cy, t), sx: sc(init.sx, end.xf.sx, t), sy: sc(init.sy, end.xf.sy, t), rot: lerp(init.rot, end.xf.rot, t) };
+        tool.quad = c0.map((p, j) => ({ x: lerp(p.x, end.quad[j]?.x ?? p.x, t), y: lerp(p.y, end.quad[j]?.y ?? p.y, t) }));
+        tool.grid = grid0.map((p, j) => ({ x: lerp(p.x, end.grid[j]?.x ?? p.x, t), y: lerp(p.y, end.grid[j]?.y ?? p.y, t) }));
+        const tgt = e.blankTarget();
+        tool.renderTo(tgt, src, null);
+        if (!e.insertLayerWith(tgt, `${A.name} · ${k}/${n + 1}`, e.layers.indexOf(B), 'Tween')) { e.freeTarget(tgt); break; }
+      }
+      e.history.endGroup('Tween');
+      e.active = e.layers.indexOf(B);
+      a.apply(); this.updateUndoButtons();
+      this.toast(`Tween · ${n} in-betweens`);
+    }, init);
+  }
+
   async startLayerTransform() {
     this.exitFillTool();
     this.settle(); this.closePop();

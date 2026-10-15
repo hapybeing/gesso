@@ -47,7 +47,11 @@ export interface AnimHost {
   audio?: AnimAudio;
   /** pick and import an audio file */
   importAudio?(): void;
+  /** transform tween from the current frame: n in-betweens, then the end pose set with the transform box */
+  tween?(n: number, ease: Ease): void;
 }
+export type Ease = 'linear' | 'in' | 'out' | 'inout';
+export const EASE: Record<Ease, (t: number) => number> = { linear: (t) => t, in: (t) => t * t, out: (t) => 1 - (1 - t) * (1 - t), inout: (t) => t * t * (3 - 2 * t) };
 
 export class Animator {
   st: AnimState = defaultAnim();
@@ -428,12 +432,32 @@ export class Animator {
           btn('Insert blank', () => { this.addFrame(); this.closePop(); }),
           btn('◀ Move', () => this.moveFrame(-1), i <= 0), btn('Move ▶', () => this.moveFrame(1), i >= fr.length - 1),
           btn(this.st.pins.includes(f.base.uid) ? 'Unpin from light table' : 'Pin to light table', () => this.togglePin(f.base)),
+          this.host.tween && !f.base.group ? btn('Tween…', () => this.openTween(anchor)) : null,
           h('button', { class: 'chip danger-text', disabled: this.e.layers.length <= 1, onClick: () => { this.deleteFrame(); this.closePop(); } }, 'Delete')),
         h('div', { class: 'fo-row' }, h('span', { class: 'muted' }, 'Show on every frame'),
           btn('Under', () => { this.setRole(f.base, 'bg'); this.closePop(); }), btn('Over', () => { this.setRole(f.base, 'fg'); this.closePop(); })),
       );
       const roles = this.e.layers.filter((l) => this.st.roles[l.uid]);
       if (roles.length) p.append(h('div', { class: 'fo-row' }, h('span', { class: 'muted' }, 'On every frame:'), ...roles.map((l) => h('button', { class: 'chip on', title: 'Make it a frame again', onClick: () => { this.setRole(l, null); draw(); } }, `${l.name} (${this.st.roles[l.uid] === 'bg' ? 'under' : 'over'}) ×`))));
+    };
+    draw();
+  }
+
+  private tweenN = 4; private tweenEase: Ease = 'inout';
+  /** tween options, then the end pose in the transform box */
+  openTween(anchor: HTMLElement | null) {
+    const p = this.popAt(anchor, 'fopts');
+    const draw = () => {
+      p.innerHTML = '';
+      const n = this.tweenN;
+      p.append(h('div', { class: 'pop-head' }, h('b', {}, 'Tween')),
+        h('p', { class: 'muted' }, 'Move, scale or rotate a copy of this frame into its end pose; Gesso draws the frames in between.'),
+        h('div', { class: 'fo-row' }, h('span', {}, 'In-betweens'), h('button', { class: 'ib small', onClick: () => { this.tweenN = Math.max(1, n - 1); draw(); } }, '−'),
+          h('b', { class: 'fo-val' }, String(n)), h('button', { class: 'ib small', onClick: () => { this.tweenN = Math.min(48, n + 1); draw(); } }, '+'),
+          h('span', { class: 'muted' }, `${n + 2} frames · ${((n + 1) / this.st.fps).toFixed(2)} s`)),
+        h('div', { class: 'chips' }, ...([['linear', 'Linear'], ['in', 'Ease in'], ['out', 'Ease out'], ['inout', 'Ease in & out']] as [Ease, string][]).map(([k, l]) =>
+          h('button', { class: 'chip' + (this.tweenEase === k ? ' on' : ''), onClick: () => { this.tweenEase = k; draw(); } }, l))),
+        h('div', { class: 'chips' }, h('button', { class: 'btn small', onClick: () => { this.closePop(); this.host.tween!(this.tweenN, this.tweenEase); } }, 'Set end pose…')));
     };
     draw();
   }

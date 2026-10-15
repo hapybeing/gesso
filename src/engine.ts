@@ -961,6 +961,11 @@ export class Engine {
   private changed() { this.markDirty(); this.onLayersChanged(); }
   private bytesPerLayer() { return this.w * this.h * 4; }
 
+  /** insert a new layer holding `t` at index (one undo step); used by tweening */
+  insertLayerWith(t: Target, name: string, index: number, label: string): Layer | null {
+    if (this.layers.length >= this.maxLayersFor(this.w, this.h)) return null;
+    const l = new Layer(name, t); this.insertLayer(l, index, label); return l;
+  }
   private insertLayer(layer: Layer, index: number, label: string) {
     const prevActive = this.active;
     // membership follows the position: the same group as the layer below (a group header below = beside it)
