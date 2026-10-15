@@ -452,7 +452,7 @@ void main(){ vec4 f = texture(uF, vUv); o = vec4(clamp(f.r + f.b, 0.0, 1.0), 0.0
 
 // Fill / gradient / recolour onto a layer (M5). Coverage (optional, R8 over uRect in doc px) × selection × opacity.
 // uMode 0 solid uC0 · 1 linear uP0→uP1 · 2 radial (centre uP0, radius |uP1−uP0|) · 3 recolour: every covered
-// pixel keeps its offset from the seed colour uSeed (shading and anti-aliasing survive), shifted to uC0.
+// pixel takes uC0 with its lightness relative to the seed colour uSeed (shading and anti-aliasing survive).
 // Colours are straight RGBA; gradients interpolate premultiplied (no dark fringe toward transparent) and are
 // dithered by ±½ LSB so 8-bit gradients do not band. Alpha lock recolours existing paint only.
 export const PAINT_FS = `#version 300 es
@@ -467,8 +467,12 @@ void main(){
   float m = (uUseSel == 1 ? texture(uSel, vUv).r : 1.0) * uOpacity;
   if (uUseCov == 1) { vec2 q = (p - uRect.xy) / uRect.zw; m *= (q.x < 0.0 || q.y < 0.0 || q.x > 1.0 || q.y > 1.0) ? 0.0 : texture(uCov, q).r; }
   if (uMode == 3) {
+    // lightness transfer: darker than the seed scales the new colour down, lighter blends it toward white,
+    // so shading and anti-aliasing keep their relative steps without clipping to black or white
     vec3 s = L.a > 0.0 ? L.rgb / L.a : vec3(0.0);
-    vec3 n = clamp(s + (uC0.rgb - uSeed), 0.0, 1.0);
+    const vec3 W = vec3(0.2126, 0.7152, 0.0722);
+    float sl = dot(uSeed, W), pl = dot(s, W);
+    vec3 n = pl <= sl ? uC0.rgb * (pl / max(sl, 1e-3)) : mix(uC0.rgb, vec3(1.0), (pl - sl) / max(1.0 - sl, 1e-3));
     o = vec4(mix(L.rgb, n * L.a, m), L.a); return;
   }
   vec4 c0 = vec4(uC0.rgb * uC0.a, uC0.a), pc = c0;

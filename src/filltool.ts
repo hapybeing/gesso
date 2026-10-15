@@ -18,20 +18,50 @@ const INF = 1e20;
 /** exact squared Euclidean distance transform (Felzenszwalb & Huttenlocher) of a 0/INF grid, in place */
 export function edt(f: Float32Array, W: number, H: number) {
   const n = Math.max(W, H), d = new Float32Array(n), v = new Int32Array(n), z = new Float32Array(n + 1), g = new Float32Array(n);
-  const pass = (len: number, get: (i: number) => number, set: (i: number, x: number) => void) => {
-    for (let i = 0; i < len; i++) g[i] = get(i);
-    let k = 0; v[0] = 0; z[0] = -INF; z[1] = INF;
-    for (let q = 1; q < len; q++) {
-      let s = ((g[q] + q * q) - (g[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]);
-      while (s <= z[k]) { k--; s = ((g[q] + q * q) - (g[v[k]] + v[k] * v[k])) / (2 * q - 2 * v[k]); }
+  // one 1-D lower-envelope pass over f[o], f[o+st], … (len samples); written without closures (R5: 3–4× faster)
+  const pass = (o: number, st: number, len: number) => {
+    let any = false;
+    for (let i = 0, j = o; i < len; i++, j += st) { const x = f[j]; g[i] = x; if (x < INF) any = true; }
+    if (!any) return;                 // a row/column with no seed stays INF
+    // lower envelope of the parabolas rooted at finite samples only
+    let k = -1;
+    for (let q = 0; q < len; q++) {
+      const gq = g[q]; if (gq >= INF) continue;
+      if (k < 0) { k = 0; v[0] = q; z[0] = -INF; z[1] = INF; continue; }
+      const hq = gq + q * q;
+      let vk = v[k], s = (hq - (g[vk] + vk * vk)) / (2 * (q - vk));
+      while (s <= z[k]) { k--; vk = v[k]; s = (hq - (g[vk] + vk * vk)) / (2 * (q - vk)); }
       k++; v[k] = q; z[k] = s; z[k + 1] = INF;
     }
     k = 0;
-    for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; d[q] = (q - v[k]) * (q - v[k]) + g[v[k]]; }
-    for (let i = 0; i < len; i++) set(i, d[i]);
+    for (let q = 0; q < len; q++) { while (z[k + 1] < q) k++; const t = q - v[k]; d[q] = t * t + g[v[k]]; }
+    for (let i = 0, j = o; i < len; i++, j += st) f[j] = d[i];
   };
-  for (let x = 0; x < W; x++) pass(H, (i) => f[i * W + x], (i, val) => { f[i * W + x] = val; });
-  for (let y = 0; y < H; y++) { const o = y * W; pass(W, (i) => f[o + i], (i, val) => { f[o + i] = val; }); }
+  for (let x = 0; x < W; x++) pass(x, W, H);
+  for (let y = 0; y < H; y++) pass(y * W, 1, W);
+}
+
+/**
+ * Squared Euclidean distance to the nearest seed (mask[k] != 0), exact up to C px and clamped to (C+1)² beyond.
+ * Separable: a capped vertical distance (two sweeps), then each row scatters dx² + c² over ±C. Inside a run of
+ * seeds only its two ends scatter, so the cost follows the seeds' perimeter × C, not the area (R5: replaces a
+ * full-image EDT; 4 Mpx with gap closing 1.5 s → ~0.1 s in node).
+ */
+export function nearDist2(mask: Uint8Array, W: number, H: number, C: number): Uint16Array {
+  const N = W * H, cap = Math.min(254, C + 1), col = new Uint8Array(N);
+  for (let x = 0; x < W; x++) col[x] = mask[x] ? 0 : cap;
+  for (let k = W; k < N; k++) { if (mask[k]) col[k] = 0; else { const u = col[k - W] + 1; col[k] = u < cap ? u : cap; } }
+  for (let k = N - W - 1; k >= 0; k--) { const dn = col[k + W] + 1; if (dn < col[k]) col[k] = dn; }
+  const out = new Uint16Array(N).fill(cap * cap);
+  for (let y = 0, o = 0; y < H; y++, o += W) {
+    for (let x = 0; x < W; x++) {
+      const c = col[o + x]; if (c > C) continue;
+      if (c === 0 && x > 0 && x < W - 1 && col[o + x - 1] === 0 && col[o + x + 1] === 0) { out[o + x] = 0; continue; }
+      const c2 = c * c, a = Math.max(0, x - C), b = Math.min(W - 1, x + C);
+      for (let t = a; t <= b; t++) { const dx = t - x, v = dx * dx + c2; if (v < out[o + t]) out[o + t] = v; }
+    }
+  }
+  return out;
 }
 
 export interface FillResult { cov: Uint8Array; rect: Rect; seed: [number, number, number]; area: number; closedGap: boolean; }
@@ -66,10 +96,9 @@ export function regionFill(px: Uint8Array, W: number, H: number, sx: number, sy:
     // passable = within threshold, and (with gap closing) farther than `gap` from any barrier pixel
     let pass: Uint8Array;
     if (o.gap > 0) {
-      const f = new Float32Array(N); for (let k = 0; k < N; k++) f[k] = dist[k] > hard ? 0 : INF;
-      edt(f, W, H);
-      const g2 = o.gap * o.gap;
-      pass = new Uint8Array(N); for (let k = 0; k < N; k++) pass[k] = f[k] > g2 ? 1 : 0;
+      const bar = new Uint8Array(N); for (let k = 0; k < N; k++) bar[k] = dist[k] > hard ? 1 : 0;
+      const d2 = nearDist2(bar, W, H, o.gap), g2 = o.gap * o.gap;
+      pass = new Uint8Array(N); for (let k = 0; k < N; k++) pass[k] = d2[k] > g2 ? 1 : 0;
       if (!pass[sy * W + sx]) { for (let k = 0; k < N; k++) pass[k] = dist[k] <= hard ? 1 : 0; } else closedGap = true;
     } else { pass = new Uint8Array(N); for (let k = 0; k < N; k++) pass[k] = dist[k] <= hard ? 1 : 0; }
     // scanline flood (4-connected) over pass
@@ -89,7 +118,8 @@ export function regionFill(px: Uint8Array, W: number, H: number, sx: number, sy:
       // regrow by gap+1 px through non-barrier pixels only (geodesic BFS), so the fill reaches into corners
       // the dilated barrier cut off, without crossing a line
       const R = o.gap + 1; let front: number[] = [];
-      for (let k = 0; k < N; k++) if (region[k]) front.push(k);
+      // only the region's boundary seeds the regrow (an all-canvas region would otherwise push millions)
+      for (let k = 0; k < N; k++) if (region[k]) { const x = k % W; if ((x > 0 && !region[k - 1]) || (x < W - 1 && !region[k + 1]) || (k >= W && !region[k - W]) || (k < N - W && !region[k + W])) front.push(k); }
       for (let step = 0; step < R && front.length; step++) {
         const next: number[] = [];
         for (const k of front) {
@@ -108,23 +138,32 @@ export function regionFill(px: Uint8Array, W: number, H: number, sx: number, sy:
   const cov = new Uint8Array(N); let area = 0;
   let x1 = W, y1 = H, x2 = -1, y2 = -1;
   const mark = (k: number, v: number) => { if (v > cov[k]) cov[k] = v; const x = k % W, y = (k - x) / W; if (x < x1) x1 = x; if (x > x2) x2 = x; if (y < y1) y1 = y; if (y > y2) y2 = y; };
-  for (let k = 0; k < N; k++) {
-    if (region[k]) { mark(k, 255); area++; continue; }
-    const d = dist[k]; if (d >= soft) continue;
-    const x = k % W;
-    if ((x > 0 && region[k - 1]) || (x < W - 1 && region[k + 1]) || (k >= W && region[k - W]) || (k < N - W && region[k + W])) mark(k, Math.round(255 * (soft - d) / (soft - hard)));
+  const sw = 255 / (soft - hard);
+  for (let y = 0, k = 0; y < H; y++) {
+    let rx1 = W, rx2 = -1;
+    for (let x = 0; x < W; x++, k++) {
+      if (region[k]) { cov[k] = 255; area++; if (x < rx1) rx1 = x; rx2 = x; continue; }
+      const d = dist[k]; if (d >= soft) continue;
+      if ((x > 0 && region[k - 1]) || (x < W - 1 && region[k + 1]) || (y > 0 && region[k - W]) || (y < H - 1 && region[k + W])) {
+        cov[k] = Math.round(sw * (soft - d)); if (x < rx1) rx1 = x; if (x > rx2) rx2 = x;
+      }
+    }
+    if (rx2 >= 0) { if (rx1 < x1) x1 = rx1; if (rx2 > x2) x2 = rx2; if (y < y1) y1 = y; y2 = y; }
   }
   if (x2 < 0) return null;
   if (o.expand > 0) {
     // grow under the line art: distance to the region, full inside expand, 1-px anti-aliased rim
     const e = o.expand, pad = Math.ceil(e) + 2;
     const bx = Math.max(0, x1 - pad), by = Math.max(0, y1 - pad), bw = Math.min(W, x2 + pad + 1) - bx, bh = Math.min(H, y2 + pad + 1) - by;
-    const f = new Float32Array(bw * bh);
-    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) f[y * bw + x] = cov[(by + y) * W + bx + x] >= 128 ? 0 : INF;
-    edt(f, bw, bh);
+    const m = new Uint8Array(bw * bh);
+    for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) m[y * bw + x] = cov[(by + y) * W + bx + x] >= 128 ? 1 : 0;
+    const d2 = nearDist2(m, bw, bh, Math.ceil(e) + 1);
+    const lim = (e + 1) * (e + 1);
     for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
-      const dd = Math.sqrt(f[y * bw + x]); const v = Math.max(0, Math.min(1, e + 0.5 - dd));
-      if (v > 0) mark((by + y) * W + bx + x, Math.round(v * 255));
+      const q = d2[y * bw + x]; if (q >= lim) continue;
+      const k = (by + y) * W + bx + x; if (cov[k] === 255) continue;
+      const v = Math.min(1, e + 1 - Math.sqrt(q));   // N px fully, then a 1-px rim
+      if (v > 0) mark(k, Math.round(v * 255));
     }
   }
   const rect = { x: x1, y: y1, w: x2 - x1 + 1, h: y2 - y1 + 1 };
@@ -184,10 +223,13 @@ export class FillTool implements Grab {
   }
   up(ev: PointerEvent) {
     if (this.grad && ev.pointerId === this.grad.id) { this.applyGradient(); return; }
+    // lifted before the reference pixels arrived: commit as soon as the first preview exists
+    if (this.inflight && this.inflight.id === ev.pointerId) { this.inflight.up = true; return; }
     const ss = this.session; if (!ss || ev.pointerId !== ss.id) return;
     ss.id = -1;
     if (!ss.raf) this.commit();
   }
+  private inflight: { id: number; up: boolean } | null = null;
   /** a ColorDrop released over the canvas at screen (x, y) */
   async drop(x: number, y: number) { await this.begin(this.e.screenToDoc(x, y), x, -1); }
 
@@ -196,7 +238,11 @@ export class FillTool implements Grab {
     if (d.x < 0 || d.y < 0 || d.x >= e.w || d.y >= e.h) return;
     if (e.activeLayer.group) { this.host.toast('Pick a layer (not a group) to fill'); return; }
     const ref = s.mode === 'recolour' ? 'layer' : s.ref;
+    const fl = this.inflight = { id, up: false };
     const px = await this.pixels(ref);
+    if (this.inflight !== fl) return;      // superseded by a newer touch
+    this.inflight = null;
+    if (fl.up) id = -1;
     const seed = { x: Math.floor(d.x), y: Math.floor(d.y) };
     this.session = { px, dist: seedDistance(px, e.w, e.h, seed.x, seed.y), seed, sx, base: s.threshold, res: null, raf: 0, id };
     this.run();
@@ -236,7 +282,7 @@ export class FillTool implements Grab {
     this.e.paintLayer({ mode: s.grad === 'linear' ? 1 : 2, c0: [c[0], c[1], c[2], 1], c1, p0: g.a, p1: g.b, label: 'Gradient' });
     this.host.changed(); this.host.overlayChanged();
   }
-  cancel() { if (this.session?.raf) cancelAnimationFrame(this.session.raf); this.session = null; this.grad = null; this.preview = null; this.host.overlayChanged(); }
+  cancel() { if (this.session?.raf) cancelAnimationFrame(this.session.raf); this.session = null; this.inflight = null; this.grad = null; this.preview = null; this.host.overlayChanged(); }
 
   // -------------------------------------------------------------- overlay
   private preview: { c: HTMLCanvasElement; rect: Rect } | null = null;

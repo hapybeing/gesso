@@ -206,7 +206,7 @@ class App {
         if (ref === 'reference' && rl) return e.readLayerAsync(rl);
         return e.compositePixelsAsync(false);
       },
-      overlayChanged: () => { this.ovDirty = true; }, toast: (m) => this.toast(m), changed: () => { this.pushRecent(); },
+      overlayChanged: () => { this.ovDirty = true; }, toast: (m) => this.toast(m), changed: () => { this.pushRecent(); this.saveFill(); if (this.fillOn) this.renderFillBar(); },
     });
     this.adj = new AdjustUI({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), overlayChanged: () => { this.ovDirty = true; },
       changed: () => { $('#bAdjust')?.classList.toggle('on', this.adj.active); this.updateUndoButtons(); } });
