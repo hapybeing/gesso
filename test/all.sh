@@ -14,9 +14,9 @@ case "$1" in
   7) set -- groups adjust wet ;;
   9) set -- m5a ;;
   10) set -- guides ;;
-  11) set -- fill ;;
+  11) set -- fill palette ;;
   8) set -- feel text ;;
-  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust wet feel text m5a guides fill ;;
+  *) set -- run r1 m2 gessofile quickshape symmetry transform selection bigdoc timelapse warp anim tiles groups adjust wet feel text m5a guides fill palette ;;
 esac
 fail=0
 [ "$1" = run ] && { node test/quickshape-unit.cjs | tail -1 || fail=1; }

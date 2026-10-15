@@ -24,6 +24,8 @@ import { SelectTool, SelKind } from './selecttool';
 import type { Target } from './gl';
 import { Symmetry, SymMode, defaultSymmetry, expandDabs, drawGuide, guideHandles } from './symmetry';
 import { FillTool, FillSettings, FillRef, defaultFill } from './filltool';
+import { PaletteLibrary, Palette, cleanPalette } from './palette';
+import { PaletteHost, paletteSection, DOC as DOC_PAL } from './paletteui';
 import { Guides, GuideKind, GUIDE_LABEL, defaultGuides, GuideAssist, GuideHandle, guideHandleAt, dragGuideHandle, drawGuides, rulerAngle } from './guides';
 import type { Shape } from './quickshape';
 import { dabsAlong } from './stroke';
@@ -104,10 +106,6 @@ const prefs = {
   },
 };
 
-const PALETTE = ['#1d1b19', '#4a4038', '#8c7b6b', '#d9cbb8', '#f6f0e6', '#ffffff',
-  '#7a1f1f', '#c0392b', '#e8734a', '#f2a65a', '#f5d06f', '#a8b545',
-  '#4f7c3a', '#2f6b5f', '#3c8dad', '#28477a', '#5b3f8c', '#b5578f'];
-
 // ------------------------------------------------------------------ app
 class App {
   engine: Engine;
@@ -143,6 +141,10 @@ class App {
   fillBar: HTMLElement | null = null;
   fillOn = false;
   fillSet: FillSettings = { ...defaultFill(), ...(JSON.parse(localStorage.getItem('gesso.fill') || '{}') as Partial<FillSettings>) };
+  /** palette library (localStorage) and the palette carried by the open artwork */
+  palettes = new PaletteLibrary();
+  docPalette: Palette | null = null;
+  palHost!: PaletteHost;
   /** uid of the layer marked as the fill reference (per artwork) */
   refUid: string | null = null;
   private assistPending = false;
@@ -208,6 +210,12 @@ class App {
       },
       overlayChanged: () => { this.ovDirty = true; }, toast: (m) => this.toast(m), changed: () => { this.pushRecent(); this.saveFill(); if (this.fillOn) this.renderFillBar(); },
     });
+    this.palHost = {
+      lib: this.palettes, doc: () => this.docPalette, setDoc: (p) => { this.docPalette = p; this.autosave.touch(); },
+      colour: () => this.state.color, setColour: (c) => this.setColor(c), sheet: (t) => this.sheet(t), download: (b, n, t) => this.download(b, n, t), toast: (m) => this.toast(m),
+      canvasPixels: async () => { const c = await this.engine.compositeThumbnail(256); return { px: c.getContext('2d')!.getImageData(0, 0, c.width, c.height).data, w: c.width, h: c.height }; },
+      refresh: () => { if (this.popKind === 'color' && this.pop) this.renderColor(this.pop); },
+    };
     this.adj = new AdjustUI({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), overlayChanged: () => { this.ovDirty = true; },
       changed: () => { $('#bAdjust')?.classList.toggle('on', this.adj.active); this.updateUndoButtons(); } });
     this.text = new TextTool({ engine: this.engine, input: this.input, toast: (m) => this.toast(m), color: () => [...this.state.color] as [number, number, number],
@@ -280,7 +288,7 @@ class App {
   }
 
   /** per-document state beyond layers (filled in by later features) */
-  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st } }; }
+  docExtra(): Record<string, unknown> { return { fillRef: this.refUid, symmetry: { ...this.sym }, guides: JSON.parse(JSON.stringify(this.guides)), timelapse: { on: this.tl.enabled }, anim: { ...this.anim.st }, palette: this.docPalette }; }
   applyDocExtra(x: Record<string, unknown>) {
     this.anim.load(x.anim as Partial<AnimState> | undefined);
     $('#bAnim')?.classList.toggle('on', this.anim.on);
@@ -288,6 +296,9 @@ class App {
     this.sym = { ...defaultSymmetry(this.engine.w, this.engine.h), ...(s || {}) };
     this.updateSymButton(); if (this.symBar) this.renderSymBar(); this.ovDirty = true;
     this.refUid = typeof x.fillRef === 'string' ? x.fillRef : null;
+    // an artwork that carries a palette opens with it; one without falls back to the library's
+    this.docPalette = x.palette ? cleanPalette(x.palette) : null;
+    if (this.docPalette) this.palettes.activeId = DOC_PAL; else if (this.palettes.activeId === DOC_PAL) this.palettes.activeId = this.palettes.list[0].id;
     const gd = x.guides as Partial<Guides> | undefined;
     this.guides = { ...defaultGuides(this.engine.w, this.engine.h), ...(gd || {}) };
     this.guidesChanged(false);
@@ -1244,7 +1255,7 @@ class App {
       this.state.recent.length ? h('div', { class: 'lbl' }, 'History · colours you painted with') : null,
       this.state.recent.length ? sw(this.state.recent, 'swatches') : null,
       h('div', { class: 'lbl' }, 'Palette'),
-      sw(PALETTE, 'swatches'),
+      paletteSection(this.palHost),
     ].filter(Boolean) as HTMLElement[]);
     draw();
   }
